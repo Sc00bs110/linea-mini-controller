@@ -1,6 +1,7 @@
 .pio/
 .vscode/
 include/secrets.h
+include/build_info.h
 
 # Python cache
 __pycache__/

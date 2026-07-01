@@ -12,9 +12,11 @@ design, and UI concepts from that project are the starting reference for this po
 none of its firmware source is copied in directly — this is a from-scratch
 reimplementation against the new board and display.
 
-**Status:** reference-gathering / pre-implementation. No firmware source exists yet in
-this repo — see `reference/` for everything gathered so far in preparation for starting
-the port.
+**Status:** actively porting, per the approved plan at
+`C:\Users\johnb\.claude\plans\elegant-launching-quasar.md`. Porting basis: adapt the
+~10 hardware-agnostic modules from `W:\LM_Mini.git` root `src/` (already a mostly-working
+C6 firmware — see that plan's Context section for why this supersedes the original
+"from-scratch" framing above); only the display/touch layer is a genuine rewrite.
 
 ## Hardware
 
@@ -62,17 +64,65 @@ version-bump step, and no build/upload path may skip regenerating it:
   uncommitted changes) and `FW_BUILD_TIME` (UTC ISO-8601 build timestamp).
 - `include/build_info.h` is generated, not committed — add it to `.gitignore` once
   `include/` exists as a real directory.
-- `setup()` must print it as the very first serial output, before any other init, so
-  it's the first thing visible on a fresh serial monitor attach:
+- Print it as a **repeating heartbeat in `loop()`** (every ~2s), not a one-shot line in
+  `setup()`:
   ```cpp
   #include "build_info.h"
-  Serial.begin(115200);
-  delay(100);
-  Serial.printf("Firmware build: %s (%s)\n", FW_GIT_HASH, FW_BUILD_TIME);
+  void setup() { Serial.begin(115200); delay(100); }
+  void loop() {
+      Serial.printf("Firmware build: %s (%s)\n", FW_GIT_HASH, FW_BUILD_TIME);
+      delay(2000);
+  }
   ```
+  This is a heartbeat, not a boot-only print, specifically so a **passive**
+  `/api/serial/monitor` attach can always catch it within one period — see the
+  Workbench Bench-Testing Gotchas section below for why a one-shot boot print is
+  much harder to capture reliably on this board.
 - This is deliberately not a semantic MAJOR.MINOR.PATCH version — it's a build
   fingerprint so any two uploads are always distinguishable over serial, with no
   reliance on a developer remembering to bump anything.
+
+## Workbench Bench-Testing Gotchas (native-USB ESP32-C6)
+
+Hard-won during Phase 0 bring-up — this board has no separate USB-UART bridge chip,
+only the native USB-Serial-JTAG peripheral (confirmed via `usb_devices` on `/api/devices`:
+`"USB JTAG/serial debug unit", vid_pid 303a:1001`). This changes normal workbench
+behavior in two important ways:
+
+1. **Once the app owns the USB-CDC console, `/api/flash`'s default auto-reset can stop
+   working** — it may fail repeatedly with a pyserial "Write timeout" trying to
+   re-flash a board that's actively running app firmware over native USB-CDC.
+   `/api/serial/recover` and manual `/api/gpio/set` BOOT/EN toggling did **not**
+   reliably fix this in testing. **What worked**: physically hold BOOT, tap RESET,
+   release RESET then BOOT (classic manual bootloader entry) immediately before calling
+   `/api/flash` — do this whenever a re-flash hangs on a running app.
+2. **`/api/serial/reset` forces the chip into ROM `DOWNLOAD` mode on this board, not a
+   normal app reset.** Its DTR/RTS toggle sequence is the classic esptool
+   enter-bootloader pattern; on this native-USB C6 that pattern is interpreted as a
+   genuine bootloader-entry request (confirmed via `boot:0x27 DOWNLOAD(...)` in the ROM
+   banner after calling it), not a soft reset back into the app. **Do not use
+   `/api/serial/reset` to capture app boot output on this board.** A debug-session-based
+   JTAG reset (a JTAG "reset run" reports `Reset cause (24) - JTAG CPU reset` and does
+   resume the app, unlike the DTR/RTS path) avoids forcing download mode.
+3. **Even with the heartbeat print + JTAG-safe reset + passive `/api/serial/monitor`,
+   no serial data came through in testing (Phases 0 and 1, repeatedly, with and without
+   a preceding reset).** Root cause identified from Arduino-ESP32's actual `HWCDC.cpp`
+   source (`cores/esp32/HWCDC.cpp` in `espressif/arduino-esp32`): unlike a discrete
+   USB-UART bridge chip (which the ESP32-WROOM predecessor board used, and which just
+   emits bytes over UART0 unconditionally regardless of whether a host is listening),
+   the C6's native USB-Serial-JTAG peripheral gates TX on a `connected` flag that
+   depends on detecting genuine USB Start-of-Frame traffic from an actively-connected
+   host (`isCDC_Connected()`). The Arduino-ESP32 source itself documents this detection
+   as flaky by Espressif's own admission (`"the SOF watchdog ... known to flap even on
+   a healthy link"`, `"SOF ISR is causing esptool to be unable to upload firmware"`) —
+   the same underlying flakiness likely explains the USB re-enumeration/flapping seen
+   during flashing (see point 1). **This is a hardware/core-level characteristic of
+   this board, not a bug in this project's firmware or a fixable workbench API call.**
+   **Practical implication:** don't treat workbench serial-monitor capture as a hard
+   verification requirement for this board. A real terminal (PuTTY, Arduino Serial
+   Monitor) on a machine with a *direct* physical USB connection to the board — not
+   relayed through the workbench's RFC2217 proxy — is more likely to see output
+   reliably, since it sidesteps whatever is confusing the connection-detection here.
 
 ## Reference Material
 
