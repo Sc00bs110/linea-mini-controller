@@ -1,0 +1,214 @@
+#include "machine.h"
+#include "gicar.h"
+#include "settings.h"
+#include "wlog.h"
+#include <Arduino.h>
+
+// ── Machine state ──────────────────────────────────────────────────────────────
+// Owned here; populated by machine_update() from gicar's parsed R/Z frames.
+MachineState machine = {};
+
+// Pending brew-stop wake: non-zero means send wake command at that millis() value.
+static uint32_t s_brew_stop_wake_ms = 0;
+
+// Disconnect timeout: mark the machine offline if no R or Z frame arrives within
+// this window. The R-frame poll runs at ~760 ms, so 3 s tolerates a few misses.
+static const uint32_t DISCONNECT_TIMEOUT_MS = 3000;
+
+// Temperature command bounds (register 0x0007). The Linea Mini app constrains the
+// coffee setpoint to 88–96 °C; clamp here so a bad UI/NVS value never reaches the
+// machine.
+static const float TEMP_MIN_C = 88.0f;
+static const float TEMP_MAX_C = 96.0f;
+
+// ── Standby config-sync registers ──────────────────────────────────────────────
+// After toggling standby (0x0000) the original gateway re-pushes these config
+// bytes (all 0x00). Observed in capture 12_standby_toggle; mirrored here so the
+// machine accepts the standby/wake transition cleanly.
+static const uint16_t STANDBY_SYNC_REGS[] = {0x0400, 0x0401, 0x0402, 0x0406};
+
+// ── Internal helpers ───────────────────────────────────────────────────────────
+
+// Write a single byte to a Gicar register. Most commands are 1-byte payloads.
+static void gicar_write_byte(uint16_t addr, uint8_t value) {
+    gicar_write(addr, &value, 1);
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────────
+
+void machine_init() {
+    // gicar_init() drives the full boot sequence (X-probe, identity read, config
+    // block read) and starts the always-on R-frame poll. No H48 handshake or
+    // heartbeat is required — the poll itself keeps the machine streaming.
+    gicar_init();
+
+    machine = {};
+
+    // Until the machine reports its real setpoint via the boot config read, fall
+    // back to the NVS-persisted coffee setpoint so the UI shows a sane value.
+    machine.setpoint_c = settings.coffee_temp_c;
+}
+
+void machine_update() {
+    // Drain Serial1, run the poll cadence, and parse any R/Z frames.
+    gicar_process();
+
+    // ── Brew-stop wake: fires 500 ms after machine_brew_stop() ──────────────────
+    if (s_brew_stop_wake_ms != 0 && millis() >= s_brew_stop_wake_ms) {
+        s_brew_stop_wake_ms = 0;
+        gicar_write_byte(0x0000, 0x01);
+        for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
+        wlogf("[machine] brew_stop: wake sent\n");
+    }
+
+    // Debounce timer: brew_active only clears after 1 s of continuous false R-frames.
+    // Absorbs single missed/corrupted polls caused by BLE scan coexistence interference.
+    static uint32_t s_brew_false_ms = 0;
+
+    // ── R-frame: authoritative machine state (~760 ms cadence) ──────────────────
+    if (gicar_r_frame_ready()) {
+        bool r_brew = gicar_r_brew_active();
+        machine.coffee_temp_c   = gicar_r_temp();
+        machine.boiler_flags    = gicar_r_boiler_flags();
+        machine.steam_active    = (machine.boiler_flags & BF_STEAM_BOILER_ON) != 0;
+        machine.heating_element = (machine.boiler_flags & BF_HEATING_ELEMENT) != 0;
+        machine.pump_active     = (machine.boiler_flags & BF_PUMP_ACTIVE) != 0;
+        machine.last_frame_ms   = millis();
+        machine.connected       = true;
+
+        if (r_brew) {
+            machine.brew_active = true;
+            s_brew_false_ms     = 0;
+        } else if (machine.brew_active) {
+            if (s_brew_false_ms == 0) s_brew_false_ms = millis();
+            if (millis() - s_brew_false_ms > 1000) {
+                machine.brew_active = false;
+                s_brew_false_ms     = 0;
+            }
+        }
+
+        // Throttle logging to ~1 Hz so the R-frame cadence doesn't flood the log.
+        static uint32_t last_r_log_ms = 0;
+        if (millis() - last_r_log_ms >= 1000) {
+            last_r_log_ms = millis();
+            wlogf("[machine] R temp=%.1f brew=%d flags=%02X steam=%d heat=%d pump=%d\n",
+                  machine.coffee_temp_c, machine.brew_active, machine.boiler_flags,
+                  machine.steam_active, machine.heating_element, machine.pump_active);
+        }
+    }
+
+    // ── Z-frame: high-resolution shot telemetry (~11 Hz, only during brew) ───────
+    // Z-frames give a faster temp/shot signal than the R-frame poll, but they only
+    // appear while brewing, so they cannot drive disconnect detection on their own
+    // (the R-frame poll handles the idle case). Also used to hold brew_active up
+    // through single missed R-frame polls (BLE coexistence glitches).
+    if (gicar_frame_ready()) {
+        machine.z_shot_active = gicar_z_shot_active();
+        machine.z_temp_c      = gicar_z_temp();
+        machine.last_frame_ms = millis();
+        machine.connected     = true;
+        if (machine.z_shot_active) {
+            machine.brew_active = true;
+            s_brew_false_ms     = 0;
+        }
+    }
+
+    // ── Shot tracking ────────────────────────────────────────────────────────────
+    // Use the R-frame brew flag as the primary edge source: it is present both
+    // inside and outside a shot, whereas Z-frames vanish at idle.
+    static bool prev_brew = false;
+    if (!prev_brew && machine.brew_active) {
+        machine.shot_start_ms = millis();
+        wlogf("[machine] shot START\n");
+    }
+    if (prev_brew && !machine.brew_active) {
+        wlogf("[machine] shot END duration=%.1fs\n",
+              (millis() - machine.shot_start_ms) / 1000.0f);
+    }
+    prev_brew = machine.brew_active;
+
+    // ── Setpoint pickup ──────────────────────────────────────────────────────────
+    // The boot config read populates gicar_r_setpoint() shortly after init. Latch
+    // the first sane value (>50 °C filters the zero/uninitialised state) so the UI
+    // tracks the machine's real setpoint instead of the NVS fallback.
+    static bool setpoint_loaded = false;
+    if (!setpoint_loaded && gicar_r_setpoint() > 50.0f) {
+        machine.setpoint_c = gicar_r_setpoint();
+        setpoint_loaded = true;
+        wlogf("[machine] setpoint loaded=%.1f\n", machine.setpoint_c);
+    }
+
+    // ── Disconnect timeout ───────────────────────────────────────────────────────
+    if (machine.connected && (millis() - machine.last_frame_ms) > DISCONNECT_TIMEOUT_MS) {
+        machine.connected = false;
+        wlogf("[machine] disconnected — no frames for %lu ms\n",
+              (unsigned long)DISCONNECT_TIMEOUT_MS);
+    }
+}
+
+// ── Commands ───────────────────────────────────────────────────────────────────
+
+void machine_set_temp(float celsius) {
+    celsius = constrain(celsius, TEMP_MIN_C, TEMP_MAX_C);
+
+    // Register 0x0007 takes the setpoint as a big-endian uint16 of (°C * 10).
+    int val = (int)(celsius * 10.0f + 0.5f);
+    uint8_t data[2] = { (uint8_t)(val >> 8), (uint8_t)(val & 0xFF) };
+    gicar_write(0x0007, data, 2);
+    wlogf("[machine] set_temp=%.1f (raw=%d)\n", celsius, val);
+}
+
+void machine_set_steam(bool on) {
+    // Register 0x00E1: 0x81 = steam boiler on, 0x01 = off.
+    gicar_write_byte(0x00E1, on ? 0x81 : 0x01);
+    wlogf("[machine] set_steam=%d\n", on);
+}
+
+void machine_set_preinfusion(bool on) {
+    // Register 0x000B: 0x01 = enable preinfusion, 0x00 = disable.
+    gicar_write_byte(0x000B, on ? 0x01 : 0x00);
+    wlogf("[machine] set_preinfusion=%d\n", on);
+}
+
+void machine_set_preinfusion_dur(uint8_t v) {
+    // Register 0x00E2: preinfusion duration. App range 2–20; unit TBD.
+    gicar_write_byte(0x00E2, v);
+    wlogf("[machine] set_preinfusion_dur=%u\n", v);
+}
+
+void machine_trigger_clean() {
+    // Register 0x00E1: 0x82 pulse. The caller must repeat at ~1 Hz for the full
+    // ~130 s clean cycle; a single write does not run the cycle to completion.
+    gicar_write_byte(0x00E1, 0x82);
+}
+
+void machine_set_standby(bool standby) {
+    // Verified sequence (capture 12_standby_toggle):
+    //   1. 0x0000: 0x00 = enter standby, 0x01 = wake.
+    //   2. 0x0400/0x0401/0x0402/0x0406: 0x00 config-sync push.
+    //   3. On wake, re-assert the persisted steam state (the machine clears it on
+    //      standby), otherwise steam silently stays off after waking.
+    gicar_write_byte(0x0000, standby ? 0x00 : 0x01);
+
+    for (uint16_t reg : STANDBY_SYNC_REGS) {
+        gicar_write_byte(reg, 0x00);
+    }
+
+    if (!standby && settings.steam_on) {
+        gicar_write_byte(0x00E1, 0x81);
+    }
+
+    machine.standby = standby;
+    wlogf("[machine] set_standby=%d (steam_reassert=%d)\n",
+          standby, (!standby && settings.steam_on));
+}
+
+// Brew stop: standby (0x0000=0x00 + sync regs) stops the pump even with the lever
+// held — confirmed empirically 2026-06-25. Wake is sent 500 ms later via the timer
+// in machine_update(). machine.standby is NOT set so the UI stays in "active" state.
+void machine_brew_stop() {
+    gicar_write_byte(0x0000, 0x00);
+    for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
+    s_brew_stop_wake_ms = millis() + 500;
+    wlogf("[machine] brew_stop: standby sent, wake in 500ms\n");
+}

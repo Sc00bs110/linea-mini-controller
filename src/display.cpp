@@ -1,12 +1,13 @@
-// Phase 2 -- raw display bring-up (no LVGL).
+// Phase 3 -- display + LVGL bring-up.
 //
 // Drives the DFRobot 3.5" GDI display (SKU DFR1092) through LovyanGFX, treating
-// it as an ILI9488 panel. The DFR1092's datasheet nominally lists a ST7365P
-// controller, but the DFRobot_GDL/ST7365P path never lit the physical panel;
-// LovyanGFX's ILI9488 driver was confirmed to render correctly on the real
-// hardware, so that is what we use here. The panel is native 320x480 portrait;
-// setRotation(5) presents it as the 480x320 landscape the espresso UI expects in
-// later phases, with X mirrored to correct the DFR1092 GDI physical orientation.
+// it as an ILI9488 panel, and registers it as LVGL's display driver. The
+// DFR1092's datasheet nominally lists a ST7365P controller, but the
+// DFRobot_GDL/ST7365P path never lit the physical panel; LovyanGFX's ILI9488
+// driver was confirmed to render correctly on the real hardware, so that is what
+// we use here. The panel is native 320x480 portrait; setRotation(5) presents it
+// as the 480x320 landscape the espresso UI expects, with X mirrored to correct
+// the DFR1092 GDI physical orientation.
 //
 // GDI-to-GPIO mapping (from platformio.ini build_flags, single source of truth):
 //   SCLK = TFT_SCLK (23)  MOSI = TFT_MOSI (22)  MISO = TFT_MISO (21)
@@ -16,6 +17,7 @@
 
 #include <Arduino.h>
 #include <LovyanGFX.hpp>
+#include <lvgl.h>
 
 #include "display.h"
 
@@ -78,49 +80,40 @@ public:
 static LGFX tft;
 
 // Landscape + mirror-X orientation (rotation 5) -> 480 wide x 320 tall, matching
-// the UI layout ported in Phase 3. Kept as a named constant so the Phase 2
-// exit-gate (visual orientation check) has a single place to adjust if it reads
-// mirrored. Rotation 5 (not 1) corrects the DFR1092 GDI physical orientation --
-// this was determined empirically on the real panel.
+// the UI layout. Rotation 5 (not 1) corrects the DFR1092 GDI physical orientation
+// -- this was determined empirically on the real panel during Phase 2.
 static const uint8_t DISPLAY_ROTATION = 5;
 
-// Paint an intentionally asymmetric pattern so a human can spot a mirror or
-// 180-degree flip at a glance: a distinct color in each corner (all different),
-// a single origin marker box anchored at the top-left, and a white frame. A
-// symmetric border alone could not reveal orientation errors.
-static void draw_test_pattern() {
-    const int16_t w = tft.width();
-    const int16_t h = tft.height();
+// LVGL logical resolution after setRotation(5): 480 wide x 320 tall landscape.
+static const uint32_t SCREEN_W = 480;
+static const uint32_t SCREEN_H = 320;
 
-    // Solid, distinctive background so a lit-but-dead-controller panel (which
-    // would show noise/white) is obviously distinguishable from a working one.
-    tft.fillScreen(TFT_BLUE);
+// ── LVGL display driver ─────────────────────────────────────────────────────
+// Single partial draw buffer covering 10 full rows (480 * 10 = 4800 px). This is
+// the exact buffer size used by the confirmed-working reference bring-up. LVGL
+// renders a dirty region into this buffer, then disp_flush() blits it to the
+// panel; a partial buffer keeps RAM low (no full-frame framebuffer -- the C6 has
+// no PSRAM).
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t         lv_buf[SCREEN_W * 10];
 
-    // White frame: 4 px inset border on all four edges.
-    const int16_t b = 4;
-    tft.fillRect(0, 0, w, b, TFT_WHITE);          // top
-    tft.fillRect(0, h - b, w, b, TFT_WHITE);      // bottom
-    tft.fillRect(0, 0, b, h, TFT_WHITE);          // left
-    tft.fillRect(w - b, 0, b, h, TFT_WHITE);      // right
+// Flush a rendered region to the panel. This is the confirmed-working LovyanGFX
+// integration from the reference bring-up: setAddrWindow + writePixels over a
+// single startWrite/endWrite transaction, with color_p reinterpreted as
+// LovyanGFX's rgb565_t (matches LV_COLOR_DEPTH 16 in lv_conf.h).
+static void disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+    const uint32_t w = area->x2 - area->x1 + 1;
+    const uint32_t h = area->y2 - area->y1 + 1;
 
-    // Corner swatches -- every corner a different color so mirror/flip shows up.
-    const int16_t c = 48;  // swatch size
-    tft.fillRect(0, 0, c, c, TFT_RED);            // top-left
-    tft.fillRect(w - c, 0, c, c, TFT_GREEN);      // top-right
-    tft.fillRect(0, h - c, c, c, TFT_YELLOW);     // bottom-left
-    tft.fillRect(w - c, h - c, c, c, TFT_MAGENTA);// bottom-right
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.writePixels((lgfx::rgb565_t*)color_p, w * h);
+    tft.endWrite();
 
-    // Origin marker: an orange box just inside the top-left, unique in the
-    // frame, so "which corner is (0,0)" is unambiguous when read on the panel.
-    tft.fillRect(c + 8, 8, 40, 24, TFT_ORANGE);
-
-    // Center block: a white rectangle to confirm mid-panel pixels render.
-    const int16_t cw = w / 3;
-    const int16_t ch = h / 3;
-    tft.fillRect((w - cw) / 2, (h - ch) / 2, cw, ch, TFT_WHITE);
+    lv_disp_flush_ready(disp);
 }
 
-void display_init_and_test_pattern() {
+void display_init() {
     // LovyanGFX owns the SPI bus (Bus_SPI) and the backlight pin (Light_PWM via
     // LEDC); do NOT touch SPI.begin() or drive GPIO15 manually -- that would
     // fight the driver's LEDC control of the backlight.
@@ -128,5 +121,17 @@ void display_init_and_test_pattern() {
     tft.setRotation(DISPLAY_ROTATION);
     tft.setBrightness(255);
 
-    draw_test_pattern();
+    // Bring up LVGL and register this panel as its display driver. Order matters:
+    // ui_init() (called next from setup()) requires lv_disp_drv_register() to have
+    // already run -- see ui.h.
+    lv_init();
+    lv_disp_draw_buf_init(&draw_buf, lv_buf, nullptr, SCREEN_W * 10);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res  = SCREEN_W;   // 480 (landscape, per setRotation(5))
+    disp_drv.ver_res  = SCREEN_H;   // 320
+    disp_drv.flush_cb = disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
 }
