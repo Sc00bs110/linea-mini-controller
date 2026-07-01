@@ -1,0 +1,45 @@
+[env:lm_controller]
+; pioarduino provides Arduino-ESP32 3.x which adds C6 Arduino support
+; (official espressif32 ≤ 6.5 only ships Arduino-ESP32 2.x — no C6)
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/stable/platform-espressif32.zip
+board = esp32-c6-devkitc-1   ; Firebeetle 2 ESP32-C6 (DFR1075)
+framework = arduino
+
+monitor_speed = 115200
+
+; ESP32-C6: 4MB flash, no PSRAM
+; huge_app: 3MB app + ~960KB LittleFS
+board_build.partitions = huge_app.csv
+board_build.filesystem = littlefs
+
+build_flags =
+    -DCORE_DEBUG_LEVEL=0
+    -I include
+    -DLV_CONF_INCLUDE_SIMPLE
+    ; ── Display pins — ILI9341 2.4" SPI (240×320 portrait) via GDI-compatible GPIOs ──
+    ; LovyanGFX reads these in code (lgfx_setup.h / main.cpp LGFX class)
+    ; Temporary bring-up display — replace with ILI9488 when DFR1092 arrives
+    -DTFT_WIDTH=240
+    -DTFT_HEIGHT=320
+    -DTFT_MISO=21
+    -DTFT_MOSI=22
+    -DTFT_SCLK=23
+    -DTFT_CS=1
+    -DTFT_DC=8
+    -DTFT_RST=14
+    -DTFT_BL=15
+    ; No touch — ILI9341 W18366 has no touch controller
+
+lib_deps =
+    lovyan03/LovyanGFX @ ^1.1.16
+    lvgl/lvgl @ ^8.4.0
+    h2zero/NimBLE-Arduino @ ^2.0.0   ; 2.x required for Arduino-ESP32 3.x (C6)
+    knolleary/PubSubClient @ ^2.8
+
+; ── OTA upload target ─────────────────────────────────────────────────────────
+; Usage: pio run -e lm_controller_ota -t upload
+[env:lm_controller_ota]
+extends = env:lm_controller
+upload_port = 192.168.1.96
+upload_protocol = espota
+upload_flags = --timeout=60
