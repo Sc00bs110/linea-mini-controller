@@ -50,6 +50,30 @@ the port.
   control during bring-up and testing. See the `esp-pio-handling` / `esp-idf-handling`
   and `workbench-*` skills for driving it.
 
+## Firmware Versioning
+
+Every build must embed a fresh, auto-generated build identifier — there is no manual
+version-bump step, and no build/upload path may skip regenerating it:
+
+- `tools/gen_build_info.py` is a PlatformIO pre-build hook (wire it in with
+  `extra_scripts = pre:tools/gen_build_info.py` once `platformio.ini` exists) that
+  writes `include/build_info.h` on every `pio run` / `pio run -t upload`, defining
+  `FW_GIT_HASH` (short git commit hash, `+dirty` suffix if the working tree has
+  uncommitted changes) and `FW_BUILD_TIME` (UTC ISO-8601 build timestamp).
+- `include/build_info.h` is generated, not committed — add it to `.gitignore` once
+  `include/` exists as a real directory.
+- `setup()` must print it as the very first serial output, before any other init, so
+  it's the first thing visible on a fresh serial monitor attach:
+  ```cpp
+  #include "build_info.h"
+  Serial.begin(115200);
+  delay(100);
+  Serial.printf("Firmware build: %s (%s)\n", FW_GIT_HASH, FW_BUILD_TIME);
+  ```
+- This is deliberately not a semantic MAJOR.MINOR.PATCH version — it's a build
+  fingerprint so any two uploads are always distinguishable over serial, with no
+  reliance on a developer remembering to bump anything.
+
 ## Reference Material
 
 - `reference/lm_mini/` — curated docs pulled from `W:\LM_Mini.git` (the ESP32-WROOM
