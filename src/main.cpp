@@ -22,6 +22,9 @@
 // Ported LVGL espresso UI (pure widget logic; reads machine/scale/settings state).
 #include "ui.h"
 
+// GT911 capacitive touch -> LVGL pointer indev (drives the UI's click callbacks).
+#include "touch.h"
+
 void setup() {
     Serial.begin(115200);
     delay(100);
@@ -33,6 +36,11 @@ void setup() {
     // Panel init + lv_init() + LVGL display-driver registration. Must run before
     // ui_init(), which requires lv_disp_drv_register() to have completed.
     display_init();
+
+    // Register the GT911 touch pointer indev. LVGL indevs may register any time
+    // before the first lv_timer_handler(), so doing it right after display_init()
+    // (before the widget tree is built) is fine and keeps the ordering simple.
+    touch_init();
 
     // Build the UI widget tree on the registered LVGL display.
     ui_init();
