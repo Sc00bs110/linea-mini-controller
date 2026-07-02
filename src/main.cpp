@@ -201,47 +201,21 @@ void loop() {
         Serial.printf("Firmware build: %s (%s)\n", FW_GIT_HASH, FW_BUILD_TIME);
     }
 
-    // ── TEMP Phase 6 stall profiler ─────────────────────────────────────────
-    // The display freezes in ~5-10 s bursts whenever BLE scale scanning is
-    // enabled, even though GICAR's aggregate byte rate stays healthy -- so
-    // some call in this loop must be blocking for seconds at a time. Two
-    // plausible-fix attempts (BLE scan duty cycle/priority, hardware UART)
-    // did not change the symptom, so instead of guessing a third time: time
-    // every subsystem call and name the actual offender whenever one loop
-    // iteration exceeds 250 ms. Remove once the culprit is confirmed fixed.
-    const char* worst_name = "";
-    uint32_t    worst_ms   = 0;
-    uint32_t    iter_t0    = millis();
-    #define TIMED_CALL(name, call)                                     \
-        do {                                                           \
-            uint32_t _t = millis();                                    \
-            call;                                                      \
-            uint32_t _d = millis() - _t;                               \
-            if (_d > worst_ms) { worst_ms = _d; worst_name = name; }   \
-        } while (0)
-
     // Drain Serial1, pump the GICAR poll/parse state machine, and update the
     // `machine` struct ui.cpp reads (connected/coffee_temp_c/brew_active/...).
-    TIMED_CALL("machine_update", machine_update());
-    TIMED_CALL("shot_log_update", shot_log_update());
+    machine_update();
+    shot_log_update();
 
-    TIMED_CALL("wifi_tick", wifi_tick());
-    TIMED_CALL("mqtt_tick", mqtt_tick());
-    TIMED_CALL("wlog_tick", wlog_tick());
-    if (wifi_ap_active()) TIMED_CALL("wifi_ap_handle", wifi_ap_handle());
+    wifi_tick();
+    mqtt_tick();
+    wlog_tick();
+    if (wifi_ap_active()) wifi_ap_handle();
 
     // Pump the UI (button events, screen transitions, label updates) and LVGL's
     // own timers/rendering. lv_timer_handler() must be called frequently for a
     // responsive display; LV_TICK_CUSTOM (lv_conf.h) sources time from millis().
-    TIMED_CALL("ui_tick", ui_tick());
-    TIMED_CALL("lv_timer_handler", lv_timer_handler());
-
-    uint32_t iter_ms = millis() - iter_t0;
-    if (iter_ms > 250) {
-        wlogf("[loopstall] %lums total, worst=%s (%lums)\n",
-              (unsigned long)iter_ms, worst_name, (unsigned long)worst_ms);
-    }
-    #undef TIMED_CALL
+    ui_tick();
+    lv_timer_handler();
 
     delay(5);
 }
