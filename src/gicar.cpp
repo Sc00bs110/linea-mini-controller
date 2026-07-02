@@ -1,6 +1,5 @@
 #include "gicar.h"
 #include "wlog.h"
-#include <SoftwareSerial.h>
 #include <driver/gpio.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -10,11 +9,12 @@
 // GPIO16/17 during Phase 5 bring-up -- see gicar.h for why.)
 // CN11 signals are idle-LOW 2.5 V LVCMOS, so both lines must be inverted.
 //
-// EspSoftwareSerial is used instead of hardware UART1 because the ESP32-C6
-// HP UART shadow-register mechanism makes uart_set_line_inverse() ineffective.
-// EspSoftwareSerial applies inversion at the GPIO/ISR level, bypassing the
-// broken peripheral entirely.  At 9600 baud (104 µs/bit) software timing is
-// well within ISR latency margins.
+// Uses hardware UART1 (Serial1) with peripheral-level line inversion. An
+// inherited claim said the C6 HP UART's inversion was broken (forcing a
+// bit-banged EspSoftwareSerial fallback) -- but that claim was made while
+// debugging on physically-defective pins and turned out to be wrong; see the
+// note above _uart_setup(). Hardware UART also makes RX immune to the BLE
+// scan's interrupt-timing corruption that broke bit-banged decoding.
 //
 // All frames are ASCII printable characters. Every command and every machine
 // frame ends in a 2-char uppercase-hex checksum = (sum of the ASCII values of
@@ -31,7 +31,13 @@
 static const int      R_FRAME_LEN   = GICAR_R_FRAME_LEN;  // 81
 static const int      Z_FRAME_LEN   = GICAR_Z_FRAME_LEN;  // 54
 static const int      X_FRAME_LEN   = 11;                 // "X00000001D9"
-static const uint32_t POLL_PERIOD_MS = 100;               // R-poll cadence
+// 760 ms matches BOTH validated references (the WROOM build that worked
+// end-to-end and the C6-era rewrite) and the factory gateway's own observed
+// cadence in the sniffer captures. Our port briefly used 100 ms, which
+// saturates the 9600-baud bus (~96% line utilisation) and collides with the
+// machine's autonomous Z-frame stream during shots -- causing burst frame
+// corruption, brew_active flapping, and the stuck/jumping shot timer.
+static const uint32_t POLL_PERIOD_MS = 760;               // R-poll cadence
 static const uint32_t RX_TIMEOUT_MS  = 200;               // stale-buffer reset
 
 // Poll command: read 35 bytes (0x0023) from address 0x4000 — live machine state block.
@@ -103,38 +109,48 @@ static int _append_cs(char* cmd, int n, int cap) {
     return n;
 }
 
-// ── EspSoftwareSerial — bypasses broken C6 HP UART inversion ────────────────
-
-static SoftwareSerial _sw_serial;
+// ── Hardware UART1 (Serial1) with peripheral-level inversion ─────────────────
+//
+// Phase 6 experiment: the prior claim that "the C6 HP UART's line inversion is
+// silently ineffective" (which forced the EspSoftwareSerial bit-banged fallback)
+// originated while debugging on GPIO16/17 -- pins we have since proven were
+// physically defective on this board. The peripheral was likely misblamed for
+// a dead pin. Trying hardware UART1 + invert on the known-good GPIO2/3:
+// if it works, RX becomes FIFO-driven at the peripheral and fully immune to
+// the BLE-interrupt timing corruption that breaks bit-banged decoding at
+// 9600 baud (104 us/bit) whenever the scale's BLE scan runs on this
+// single-core chip.
+//
+// invert=true: CN11 is idle-LOW 2.5 V LVCMOS. Polarity confirmed correct on
+// this wiring: an invert=false experiment decoded only line noise, while
+// invert=true decoded byte-perfect ASCII frames.
 
 static void _uart_setup() {
-    // Release IO_MUX bootloader lock on GPIO16/17 before SoftwareSerial claims them.
+    // Release any IO_MUX claim before Serial1 takes the pins.
     gpio_reset_pin((gpio_num_t)GICAR_TX_PIN);
     gpio_reset_pin((gpio_num_t)GICAR_RX_PIN);
-    // invert=true: CN11 is idle-LOW 2.5 V LVCMOS. Confirmed correct: the
-    // invert=false experiment (Phase 5 bring-up) produced a near-idle line
-    // decoding to noise (~99% high, near-constant 0xFF with lone flipped
-    // bits), while the passive snoop module (also invert=true) decoded a
-    // byte-perfect ASCII "R40000023DB" poll frame. invert=true is right;
-    // the remaining gap is TX reaching the machine, not RX polarity.
-    //
-    _sw_serial.begin(GICAR_BAUD, SWSERIAL_8N1, GICAR_RX_PIN, GICAR_TX_PIN, true, 256);
+    // 2048, not 256: during a shot the machine streams Z-frames at ~600+ B/s
+    // (vs ~100 B/s idle), so 256 bytes is only ~0.4 s of headroom -- any loop
+    // stall longer than that overflows the FIFO and corrupts frames mid-shot.
+    // 2048 gives >3 s of headroom at shot rates.
+    Serial1.setRxBufferSize(2048);
+    Serial1.begin(GICAR_BAUD, SERIAL_8N1, GICAR_RX_PIN, GICAR_TX_PIN, true);
 }
 
 static int _uart_available() {
-    return _sw_serial.available();
+    return Serial1.available();
 }
 
 static int _uart_read_byte() {
-    return _sw_serial.read();
+    return Serial1.read();
 }
 
 static void _uart_write(const uint8_t* data, int len) {
-    _sw_serial.write(data, (size_t)len);
+    Serial1.write(data, (size_t)len);
 }
 
 static void _uart_flush() {
-    _sw_serial.flush();
+    Serial1.flush();
 }
 
 // ── Frame builders ───────────────────────────────────────────────────────────

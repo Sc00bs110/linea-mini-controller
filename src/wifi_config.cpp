@@ -1,41 +1,46 @@
-// Phase 3 stub -- real BLE/WiFi/MQTT logic ported in Phase 6.
-//
-// The real wifi_config.cpp reads/writes STA credentials in NVS. Phase 3 does not
-// bring up WiFi, so this stub reports "no credentials" and empty SSID/password.
-// The signatures match wifi_config.h exactly so ui.cpp compiles/links unchanged.
-
 #include "wifi_config.h"
-#include <stdint.h>  // for wifi_retry_count()'s uint32_t return type
+#include "secrets.h"   // WIFI_SSID / WIFI_PASSWORD as compile-time fallback
+#include <Preferences.h>
+#include <string.h>
+
+static char _ssid[33] = {};
+static char _pass[65] = {};
+static bool _has_nvs  = false;
 
 void wifi_config_init() {
-    // No NVS credential load in Phase 3.
+    Preferences prefs;
+    prefs.begin("wifi", true);
+    _has_nvs = prefs.isKey("ssid");
+    if (_has_nvs) {
+        prefs.getString("ssid", _ssid, sizeof(_ssid));
+        prefs.getString("pass", _pass, sizeof(_pass));
+    }
+    prefs.end();
 }
 
-bool wifi_config_has_credentials() {
-    return false;
-}
+bool wifi_config_has_credentials() { return _has_nvs; }
 
-const char* wifi_config_ssid() {
-    return "";
-}
-
-const char* wifi_config_pass() {
-    return "";
-}
+const char* wifi_config_ssid() { return _has_nvs ? _ssid : WIFI_SSID;     }
+const char* wifi_config_pass() { return _has_nvs ? _pass : WIFI_PASSWORD; }
 
 void wifi_config_save(const char* ssid, const char* pass) {
-    (void)ssid;
-    (void)pass;
-    // No-op in Phase 3.
+    strncpy(_ssid, ssid, 32); _ssid[32] = '\0';
+    strncpy(_pass, pass, 64); _pass[64] = '\0';
+    _has_nvs = true;
+    Preferences prefs;
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", _ssid);
+    prefs.putString("pass", _pass);
+    prefs.end();
 }
 
 void wifi_config_clear() {
-    // No-op in Phase 3.
-}
-
-// Declared `extern uint32_t wifi_retry_count();` in ui.cpp (no header). In the
-// full firmware it lives in main.cpp's WiFi driver; Phase 3 has no WiFi, so it is
-// defined here alongside the rest of the WiFi-config stub and reports zero retries.
-uint32_t wifi_retry_count() {
-    return 0;
+    _has_nvs = false;
+    _ssid[0] = '\0';
+    _pass[0] = '\0';
+    Preferences prefs;
+    prefs.begin("wifi", false);
+    prefs.remove("ssid");
+    prefs.remove("pass");
+    prefs.end();
 }
