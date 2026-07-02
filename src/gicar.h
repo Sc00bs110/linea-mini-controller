@@ -1,12 +1,23 @@
 #pragma once
 #include <Arduino.h>
 
-// UART1 pins — Firebeetle 2 ESP32-C6: GPIO16 TX, GPIO17 RX
-// Physical wiring: CN11 TXD → series R → GPIO17 (RX), 10kΩ pull-up to 3.3V on GPIO17
-//                  GPIO16 (TX) → series R → CN11 RXD
+// UART1 pins — Firebeetle 2 ESP32-C6: GPIO2 TX, GPIO3 RX
+// Moved off GPIO16/17 during Phase 5 bring-up: GPIO16/17 produced zero bytes
+// ever received despite wiring/continuity/loopback all checking out -- likely
+// a cold joint or similar physical defect at that specific header location on
+// this board, not a protocol/software issue. GPIO2/3 carry no strapping/JTAG/
+// ADC conflicts that block UART use (see
+// reference/dfrobot/firebeetle2-esp32-c6-v1.2.md).
+//
+// CONFIRMED (2026-07-02, live machine): GPIO3=RX/GPIO2=TX is the correct
+// mapping -- 432+ R-frames parsed cleanly at ~700 B/s, temp/boiler-flag
+// values matching the machine's real behavior. (A passive sniffer used
+// during bring-up had decoded our own poll on GPIO2, which pointed at the
+// opposite mapping -- that pointer was wrong; live frame parsing is the
+// ground truth here.)
 // invert=true: CN11 is idle-LOW inverted LVCMOS; pull-up level-shifts but does not invert
-#define GICAR_RX_PIN    17  // CN11 TXD → ESP RX (10kΩ pull-up + series R)
-#define GICAR_TX_PIN    16  // ESP TX → CN11 RXD (series R)
+#define GICAR_RX_PIN    3   // CN11 TXD → ESP RX (10kΩ pull-up + series R)
+#define GICAR_TX_PIN    2   // ESP TX → CN11 RXD (series R)
 #define GICAR_BAUD      9600
 #define GICAR_BUF_SIZE  128
 

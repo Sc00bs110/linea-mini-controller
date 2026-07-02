@@ -6,7 +6,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // La Marzocco Linea Mini — Gicar protocol driver
 //
-// Wire: GPIO16=TX, GPIO17=RX ↔ Gicar CN11, 9600 8N1, invert=true.
+// Wire: GPIO2=TX, GPIO3=RX ↔ Gicar CN11, 9600 8N1, invert=true. (Moved off
+// GPIO16/17 during Phase 5 bring-up -- see gicar.h for why.)
 // CN11 signals are idle-LOW 2.5 V LVCMOS, so both lines must be inverted.
 //
 // EspSoftwareSerial is used instead of hardware UART1 because the ESP32-C6
@@ -110,7 +111,13 @@ static void _uart_setup() {
     // Release IO_MUX bootloader lock on GPIO16/17 before SoftwareSerial claims them.
     gpio_reset_pin((gpio_num_t)GICAR_TX_PIN);
     gpio_reset_pin((gpio_num_t)GICAR_RX_PIN);
-    // invert=true: CN11 is idle-LOW 2.5 V LVCMOS.
+    // invert=true: CN11 is idle-LOW 2.5 V LVCMOS. Confirmed correct: the
+    // invert=false experiment (Phase 5 bring-up) produced a near-idle line
+    // decoding to noise (~99% high, near-constant 0xFF with lone flipped
+    // bits), while the passive snoop module (also invert=true) decoded a
+    // byte-perfect ASCII "R40000023DB" poll frame. invert=true is right;
+    // the remaining gap is TX reaching the machine, not RX polarity.
+    //
     _sw_serial.begin(GICAR_BAUD, SWSERIAL_8N1, GICAR_RX_PIN, GICAR_TX_PIN, true, 256);
 }
 
@@ -355,20 +362,11 @@ void gicar_process() {
         _expect_len = 0;
     }
 
-    // ── Raw hex dump of first 128 bytes received (one-shot debug) ───────────
-    static bool _raw_dumped = false;
-    static uint8_t _raw_buf[128];
-    static int     _raw_len = 0;
-
     // ── Drain UART, accumulate frames, dispatch when complete ────────────────
     for (int _b; (_b = _uart_read_byte()) >= 0; ) {
         char c = (char)_b;
         _rx_total++;
         _last_rx_ms = now;
-
-        if (!_raw_dumped && _raw_len < (int)sizeof(_raw_buf)) {
-            _raw_buf[_raw_len++] = (uint8_t)c;
-        }
 
         int flen = _frame_len_for(c);
         if (flen != 0) {
@@ -399,22 +397,6 @@ void gicar_process() {
         }
     }
 
-    // ── Delayed diagnostics (start after 15 s so TCP client has time to connect) ──
-    // Raw dump repeats every 30 s until frames successfully parse, so it can be
-    // caught whenever a TCP log client connects during a shot.
-    {
-        static uint32_t s_dump_ms = 0;
-        bool no_frames = (_frame_count == 0 && _r_frame_count == 0);
-        if (no_frames && _raw_len == (int)sizeof(_raw_buf) &&
-            millis() >= 15000 && millis() - s_dump_ms >= 30000) {
-            s_dump_ms = millis();
-            char line[280]; int n = 0;
-            n += snprintf(line+n, sizeof(line)-n, "[gicar] raw[0..127]:");
-            for (int i = 0; i < _raw_len && n < (int)sizeof(line)-5; i++)
-                n += snprintf(line+n, sizeof(line)-n, " %02X", _raw_buf[i]);
-            wlogf("%s\n", line);
-        }
-    }
     // Rate log every 5 s — includes z/r frame counts for frame-parsing diagnosis.
     {
         static uint32_t s_rate_ms = 0;
@@ -427,7 +409,6 @@ void gicar_process() {
             s_rate_ms = millis();
         }
     }
-
 }
 
 // ── Z-frame accessors ────────────────────────────────────────────────────────

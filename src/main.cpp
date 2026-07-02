@@ -1,9 +1,10 @@
-// LineaMini_C6 -- Phase 3 scaffold.
+// LineaMini_C6 -- Phase 5 scaffold.
 //
-// Boots the serial console, prints the build fingerprint as a repeating
-// heartbeat, brings up the GICAR machine-interface UART driver on GPIO16 (TX) /
-// GPIO17 (RX), initializes the display + LVGL, and runs the ported espresso UI.
-// Touch, WiFi/MQTT/BLE scale are stubbed at this phase (added in Phase 4/6).
+// Boots the serial console, initializes the display + LVGL, touch, and the
+// ported espresso UI, then brings up the GICAR machine-interface UART driver
+// on GPIO2 (TX) / GPIO3 (RX) last (see the ordering note in setup()). Prints
+// the build fingerprint as a repeating heartbeat. WiFi/MQTT/BLE scale are
+// stubbed at this phase (added in Phase 6).
 
 #include <Arduino.h>
 #include <lvgl.h>
@@ -13,8 +14,10 @@
 // FW_BUILD_TIME.
 #include "build_info.h"
 
-// GICAR machine-interface UART driver (Serial1 on GPIO16/17, 9600 8N1, invert).
-#include "gicar.h"
+// Machine-interface layer: wraps gicar.cpp's raw protocol driver in the
+// MachineState struct (connected/coffee_temp_c/brew_active/...) that ui.cpp
+// actually reads.
+#include "machine.h"
 
 // Display + LVGL bring-up (ILI9488 panel via LovyanGFX, LVGL driver registration).
 #include "display.h"
@@ -29,10 +32,6 @@ void setup() {
     Serial.begin(115200);
     delay(100);
 
-    // Bring up the GICAR link. Blocks ~3 s during the boot handshake / config
-    // read before returning; its diagnostics route to Serial via the wlog shim.
-    gicar_init();
-
     // Panel init + lv_init() + LVGL display-driver registration. Must run before
     // ui_init(), which requires lv_disp_drv_register() to have completed.
     display_init();
@@ -44,6 +43,19 @@ void setup() {
 
     // Build the UI widget tree on the registered LVGL display.
     ui_init();
+
+    // Bring up the GICAR link via the machine layer (gicar_init() plus the
+    // MachineState reset -- calling gicar_init() directly here would leave
+    // `machine` never populated, since only machine_update() reads gicar's
+    // parsed frames into it). Blocks ~3 s during the boot handshake / config
+    // read before returning; its diagnostics route to Serial via the wlog shim.
+    // Deliberately called LAST, after display/touch/UI init: the empirically-
+    // validated reference bring-up (Old Claude directories/esp32workbench/
+    // firmware/lm_controller, iterated to v0.25 on this exact board/wiring)
+    // calls machine_init() dead last in setup() too. ui.cpp already renders a
+    // sane placeholder ("--.-°C", disconnected) before real data arrives, so
+    // this ordering costs nothing functionally.
+    machine_init();
 }
 
 void loop() {
@@ -56,8 +68,9 @@ void loop() {
         Serial.printf("Firmware build: %s (%s)\n", FW_GIT_HASH, FW_BUILD_TIME);
     }
 
-    // Drain Serial1 and pump the GICAR poll/parse state machine each iteration.
-    gicar_process();
+    // Drain Serial1, pump the GICAR poll/parse state machine, and update the
+    // `machine` struct ui.cpp reads (connected/coffee_temp_c/brew_active/...).
+    machine_update();
 
     // Pump the UI (button events, screen transitions, label updates) and LVGL's
     // own timers/rendering. lv_timer_handler() must be called frequently for a
