@@ -21,7 +21,8 @@
 #define GICAR_BAUD      9600
 #define GICAR_BUF_SIZE  128
 
-#define GICAR_Z_FRAME_LEN  54  // autonomous Z6 stream: Z(1)+len(1)+'0000'(4)+data(46)+cs(2)
+#define GICAR_Z_FRAME_LEN  55  // autonomous Z6 stream: Z(1)+id(1)+'0000'(4)+data(48)+terminator(1),
+                                // confirmed against real captures (reference/lm_mini/gicar_protocol_analysis.md)
 #define GICAR_R_FRAME_LEN  81  // poll response R-frames: 1+'4000'+'0023'+35*2+2 = 81 chars
 
 // Boiler flags bitmask (R-frame payload[27])

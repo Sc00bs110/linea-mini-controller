@@ -352,7 +352,12 @@ static void ui_timer_create() {
 }
 
 static void ui_timer_update() {
-    float elapsed = (millis() - brew_start_ms) / 1000.0f;
+    // Freeze the displayed time at the shot's final duration once brewing has
+    // stopped, instead of continuing to count up through the 3 s grace period
+    // before the screen returns to Main (see returning_brew in ui_tick()).
+    float elapsed = get_brew_active()
+        ? (millis() - brew_start_ms) / 1000.0f
+        : (brew_end_ms - brew_start_ms) / 1000.0f;
     char tbuf[16];
     snprintf(tbuf, sizeof(tbuf), "%.1f s", elapsed);
     lv_label_set_text(lbl_shot_time, tbuf);

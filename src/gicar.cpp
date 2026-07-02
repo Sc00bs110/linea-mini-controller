@@ -211,24 +211,27 @@ static void _parse_r_frame(const char* buf, int len) {
     }
 }
 
-// Z6 stream frame: Z(1) + frame_len(1, = 0x36 = 54) + "0000"(4) + data(46) + cs(2) = 54 bytes.
-//   bytes[40..47]  coffee temp — 8 ASCII hex chars, big-endian uint32 / 10.0 °C
-//   bytes[48..51]  steam temp  — always "0000" (pressurestat only, no sensor)
-//   bytes[28..37]  state bytes — raw values, brewing diff not yet decoded
+// Z6 stream frame: Z(1) + id(1) + "0000"(4) + data(48) + terminator(1) = 55 bytes.
+// Field offsets/formulas confirmed against real captures (2026-06-22 sniffer
+// captures, see reference/lm_mini/gicar_protocol_analysis.md) -- this parser
+// previously used an unconfirmed frame length (54, one byte short) and an
+// unconfirmed temperature formula; both are corrected here.
+//   bytes[46..49]  coffee temp — 4 ASCII hex chars, uint16 (buf[46,47]<<8 | buf[48,49]) / 160.0
+//   bytes[34..35]  shot-active flag — 0x10=brewing, 0x00=stopped (pair index 14)
 static void _parse_z_frame(const char* buf, int len) {
     if (len != Z_FRAME_LEN || buf[0] != 'Z') {
         wlogf("[gicar] Z-frame bad header len=%d c=0x%02X\n", len, (uint8_t)buf[0]);
         return;
     }
 
-    // Coffee temp: 8 ASCII hex chars at buf[40..47] → uint32 / 10.0 °C.
-    uint32_t raw = ((uint32_t)_hex2(buf[40], buf[41]) << 24) |
-                   ((uint32_t)_hex2(buf[42], buf[43]) << 16) |
-                   ((uint32_t)_hex2(buf[44], buf[45]) <<  8) |
-                    (uint32_t)_hex2(buf[46], buf[47]);
-    _z_temp = (float)raw / 10.0f;
+    // Coffee temp: uint16 from bytes[46..49] (4 ASCII hex chars) / 160.0 °C.
+    // Cross-validated against R-frame payload[28..29] in the reference captures
+    // (e.g. Z uint16=14880 -> 93.0C matching a concurrent R-frame reading).
+    uint8_t hi = _hex2(buf[46], buf[47]);
+    uint8_t lo = _hex2(buf[48], buf[49]);
+    _z_temp = (float)(((uint16_t)hi << 8) | lo) / 160.0f;
 
-    // Shot detection: state bytes[28..37] diff not yet confirmed; keep previous logic.
+    // Shot detection: pair index 14 (bytes[34..35]). 0x10=brewing, 0x00=stopped.
     uint8_t p14 = _hex2(buf[6 + 14 * 2], buf[6 + 14 * 2 + 1]);
     bool shot = (p14 != 0x00);
     if (shot != _z_shot_active) {
