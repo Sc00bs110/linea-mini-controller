@@ -98,25 +98,25 @@ static void bookoo_notify_cb(NimBLERemoteCharacteristic* pChar,
 static bool bookoo_subscribe(NimBLEClient* pClient) {
     NimBLERemoteService* pSvc = pClient->getService(BOOKOO_SVC_UUID);
     if (!pSvc) {
-        Serial.println("[scale] Bookoo: service 0FFE not found");
+        wlogf("[scale] Bookoo: service 0FFE not found\n");
         return false;
     }
 
     NimBLERemoteCharacteristic* pNotify = pSvc->getCharacteristic(BOOKOO_NOTIFY_UUID);
     if (!pNotify || !pNotify->canNotify()) {
-        Serial.println("[scale] Bookoo: notify char FF11 missing or not notifiable");
+        wlogf("[scale] Bookoo: notify char FF11 missing or not notifiable\n");
         return false;
     }
 
     NimBLERemoteCharacteristic* pWrite = pSvc->getCharacteristic(BOOKOO_WRITE_UUID);
     if (!pWrite || !pWrite->canWrite()) {
-        Serial.println("[scale] Bookoo: write char FF12 missing or not writable");
+        wlogf("[scale] Bookoo: write char FF12 missing or not writable\n");
         return false;
     }
 
     pNotify->subscribe(true, bookoo_notify_cb);
     s_bookoo_write_char = pWrite;
-    Serial.println("[scale] Bookoo Themis Ultra: subscribed");
+    wlogf("[scale] Bookoo Themis Ultra: subscribed\n");
     return true;
 }
 
@@ -147,6 +147,17 @@ static bool felicita_subscribe(NimBLEClient* pClient) {
     Serial.println("[scale] Felicita Arc: subscribed to weight notifications");
     return true;
 }
+
+// ─── BLE client callbacks ─────────────────────────────────────────────────────
+
+// Logs WHY the link dropped: reason 0x08 (BLE_ERR_CONN_SPVN_TMO) = supervision
+// timeout, i.e. WiFi/BLE coex starved the connection on this single-radio chip;
+// 0x13 (REM_USER_CONN_TERM) = the scale itself hung up.
+class ScaleClientCb : public NimBLEClientCallbacks {
+    void onDisconnect(NimBLEClient* pClient, int reason) override {
+        wlogf("[scale] link dropped, reason=0x%02X\n", reason);
+    }
+};
 
 // ─── BLE scan callback ────────────────────────────────────────────────────────
 
@@ -199,9 +210,22 @@ static void scale_ble_task(void*) {
     // spends far less time actively scanning per unit time.
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setScanCallbacks(new ScaleScanCb(), false);
-    pScan->setActiveScan(false);
-    pScan->setInterval(320);
-    pScan->setWindow(16);
+    // Active scan is REQUIRED: the Bookoo Themis advertises its name only in
+    // the scan response, which passive scanning never requests — with
+    // setActiveScan(false) the scale is invisible to the name filter
+    // (confirmed 2026-07-03: Pi-side active scan saw "BOOKOO_SC_U 624216"
+    // while the firmware's passive scan never logged a find). Passive mode
+    // was a mitigation for loop stalls whose real cause was blocking serial
+    // writes (fixed in main.cpp/wlog.cpp), not scan radio contention.
+    pScan->setActiveScan(true);
+    // 50% duty (75 ms interval / 37.5 ms window, the reference bring-up's
+    // values). The 320/16 = 5% duty tried here earlier made discovery fail
+    // outright — three consecutive 10 s scans missed a Bookoo the Pi's
+    // adapter saw instantly. Like passive mode above, the low duty was a
+    // mitigation for the disproven radio-starvation theory; scans never run
+    // during a brew, so aggressive scanning costs nothing that matters.
+    pScan->setInterval(120);
+    pScan->setWindow(60);
 
     for (;;) {
         // Don't scan during an active brew — BLE scan disrupts the shared WiFi
@@ -214,7 +238,14 @@ static void scale_ble_task(void*) {
         pScan->clearResults();
 
         wlogf("[scale] scanning (10s)...\n");
-        pScan->start(10, true);   // blocking 10-second scan
+        // NimBLE 2.x start() takes MILLISECONDS (1.x took seconds) and is
+        // NON-blocking — it returns immediately. Poll s_found for the scan's
+        // 10 s duration; onResult() stops the scan early on a match. Without
+        // this wait, s_found was checked microseconds after the scan began,
+        // so the connect path below never executed.
+        pScan->start(10000, true);
+        for (int i = 0; i < 100 && !s_found; i++) vTaskDelay(pdMS_TO_TICKS(100));
+        pScan->stop();
 
         if (!s_found) {
             // 30s pause between scans when no scale found — BLE scan thrashes the
@@ -225,10 +256,18 @@ static void scale_ble_task(void*) {
 
         // ── Connect ──────────────────────────────────────────────────────────
         NimBLEClient* pClient = NimBLEDevice::createClient(s_target_addr);
-        pClient->setConnectTimeout(5);
+        // NimBLE 2.x: milliseconds (1.x took seconds) — setConnectTimeout(5)
+        // was a 5 ms timeout, so every connect attempt failed instantly.
+        pClient->setConnectTimeout(5000);
+        pClient->setClientCallbacks(new ScaleClientCb(), true);
+        // Relaxed connection params for WiFi/BLE coex on the shared radio:
+        // 30–60 ms interval, slave latency 4, 4 s supervision timeout. The
+        // NimBLE defaults (12ms/0/...) leave no scheduling slack when WiFi is
+        // active and the first live link died ~6 s after subscribing.
+        pClient->setConnectionParams(24, 48, 4, 400);
 
         if (!pClient->connect()) {
-            Serial.println("[scale] connect failed, retrying...");
+            wlogf("[scale] connect failed, retrying...\n");
             NimBLEDevice::deleteClient(pClient);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
@@ -274,9 +313,12 @@ static void scale_ble_task(void*) {
         scale.model       = SCALE_NONE;
         s_bookoo_write_char   = nullptr;
         s_bookoo_pending_cmd  = 0;
-        wlogf("[scale] disconnected — waiting 30s before rescan\n");
+        wlogf("[scale] disconnected — rescanning in 3s\n");
         NimBLEDevice::deleteClient(pClient);
-        vTaskDelay(pdMS_TO_TICKS(30000));  // give WiFi radio 30s clear before BLE rescan
+        // Short pause: an awake scale sleeps within minutes, so a 30 s wait
+        // here often meant never reconnecting at all. (The 30 s pause between
+        // *unsuccessful* scans above still protects WiFi at idle.)
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
