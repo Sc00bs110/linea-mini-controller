@@ -7,6 +7,7 @@
 #include "wifi_ap.h"
 #include "gicar.h"
 #include "mqtt.h"
+#include "wlog.h"
 #include <time.h>
 
 #include <Arduino.h>
@@ -635,7 +636,19 @@ static lv_obj_t *lbl_wifi_ip;
 static lv_obj_t *lbl_wifi_rssi;
 
 static void wifi_back_cb(lv_event_t *e)   { ui_show_settings(); }
-static void wifi_ap_btn_cb(lv_event_t *e) { wifi_ap_start(); ui_show_wifi_ap(); }
+static void wifi_ap_btn_cb(lv_event_t *e) {
+    wlogf("[ap] setup button pressed\n");
+    wifi_ap_start();
+    ui_show_wifi_ap();
+}
+
+// TEMP diagnostic: log where taps land on the WiFi screen (screen-level
+// CLICKED fires for any tap not consumed by a child).
+static void wifi_scr_click_dbg(lv_event_t *e) {
+    lv_point_t p;
+    lv_indev_get_point(lv_indev_get_act(), &p);
+    wlogf("[ui] wifi screen tap at x=%d y=%d\n", (int)p.x, (int)p.y);
+}
 
 static void ui_wifi_create() {
     scr_wifi = lv_obj_create(NULL);
@@ -682,6 +695,10 @@ static void ui_wifi_create() {
     make_row(76,  "Network:",  &lbl_wifi_ssid);
     make_row(114, "IP:",       &lbl_wifi_ip);
     make_row(152, "Signal:",   &lbl_wifi_rssi);
+
+    // TEMP diagnostic: see wifi_scr_click_dbg above.
+    lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scr_wifi, wifi_scr_click_dbg, LV_EVENT_CLICKED, NULL);
 
     // AP Setup button
     lv_obj_t *btn_ap = lv_obj_create(scr_wifi);
