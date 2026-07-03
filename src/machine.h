@@ -36,5 +36,11 @@ void machine_set_steam(bool on);             // 0x00E1: 0x81=on, 0x01=off
 void machine_set_standby(bool standby);      // 0x0000: 0x00=standby, 0x01=wake (verified)
 void machine_set_preinfusion(bool on);       // 0x000B: 0x01=on, 0x00=off
 void machine_set_preinfusion_dur(uint8_t v); // 0x00E2: 0x14=20 (unit TBD, app range 2–20)
-void machine_trigger_clean();                // 0x00E1: 0x82 pulse (call ~1 Hz for 130 s)
+// Clean cycle: start pulses 0x00E1=0x82 at 1 Hz from machine_update() until the
+// cycle's brew phase completes, stop is called, or the 140 s window expires.
+// (A single 0x82 write does NOT engage the cycle.)
+void machine_clean_start();
+void machine_clean_stop();
+bool machine_clean_active();
+bool machine_clean_ready();   // burst done — lever may be lifted now
 void machine_brew_stop();                    // standby+wake: confirmed empirically 2026-06-25

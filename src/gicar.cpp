@@ -38,6 +38,10 @@ static const int      X_FRAME_LEN   = 11;                 // "X00000001D9"
 // machine's autonomous Z-frame stream during shots -- causing burst frame
 // corruption, brew_active flapping, and the stuck/jumping shot timer.
 static const uint32_t POLL_PERIOD_MS = 760;               // R-poll cadence
+// Runtime-adjustable poll interval. The factory app slows polling to ~10 s
+// during a backflush cycle (capture 07) — frequent polls abort the cycle at
+// the first phase boundary.
+static uint32_t _poll_period_ms = POLL_PERIOD_MS;
 static const uint32_t RX_TIMEOUT_MS  = 200;               // stale-buffer reset
 
 // Poll command: read 35 bytes (0x0023) from address 0x4000 — live machine state block.
@@ -368,8 +372,8 @@ void gicar_init() {
 void gicar_process() {
     uint32_t now = millis();
 
-    // ── Poll cadence: send R40000023DB every POLL_PERIOD_MS ──────────────────
-    if (now - _last_poll_ms >= POLL_PERIOD_MS) {
+    // ── Poll cadence: send R40000023DB every _poll_period_ms ─────────────────
+    if (now - _last_poll_ms >= _poll_period_ms) {
         _last_poll_ms = now;
         _uart_write((const uint8_t*)POLL_CMD, (int)(sizeof(POLL_CMD) - 1));
     }
@@ -458,6 +462,10 @@ uint8_t gicar_r_boiler_flags() { return _r_boiler; }
 float   gicar_r_setpoint()     { return _r_setpoint; }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
+void gicar_set_poll_period(uint32_t ms) {
+    _poll_period_ms = (ms == 0) ? POLL_PERIOD_MS : ms;
+}
+
 void gicar_write(uint16_t addr, const uint8_t* data, uint16_t len) {
     char cmd[GICAR_BUF_SIZE];
     int n = _build_write(cmd, sizeof(cmd), addr, data, len);

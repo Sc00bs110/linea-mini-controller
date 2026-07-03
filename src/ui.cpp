@@ -117,6 +117,24 @@ static lv_obj_t *lbl_settemp_val;
 static lv_obj_t *obj_clean;
 static lv_obj_t *lbl_clean;
 static lv_obj_t *obj_clean_overlay;
+static lv_obj_t *lbl_clean_overlay_title;
+static lv_obj_t *lbl_clean_overlay_sub;
+static lv_obj_t *lbl_clean_count;
+static lv_obj_t *obj_clean_stop;
+
+// Cleaning-cycle UI state machine (drives the overlay through the process).
+// The LM backflush runs CLEAN_PHASES pump phases (~5 s pump + ~10 s pause).
+enum CleanStage { CLEAN_IDLE, CLEAN_PREP, CLEAN_WAIT_LEVER, CLEAN_RUNNING, CLEAN_DONE };
+static const int  CLEAN_PHASES = 10;   // user-counted on the real machine
+static CleanStage s_clean_stage        = CLEAN_IDLE;
+static bool       s_clean_pump_prev    = false;
+static uint32_t   s_clean_run_start_ms = 0;
+// The Z-stream flags the WHOLE cycle as one continuous shot (z_shot_active
+// stays set through the pump pauses — observed live 2026-07-03), so phases
+// can't be counted from telemetry. The cycle is deterministic (~5 × 16 s),
+// so the countdown is time-based; the z_shot_active falling edge is the
+// real end-of-cycle signal and completes the overlay automatically.
+static const uint32_t CLEAN_PHASE_MS = 8000;   // 10 phases over the ~80 s cycle
 
 // Edge adjusters (Main): NVS writes are debounced so a burst of arrow taps
 // commits once, 3 s after the last tap (see ui_tick()). The set-temp commit
@@ -176,8 +194,35 @@ static void clean_press_cb(lv_event_t *e) {
     }
 }
 
-static void clean_overlay_hide(lv_event_t *e) {
-    lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+static void clean_overlay_click(lv_event_t *e) {
+    switch (s_clean_stage) {
+        case CLEAN_PREP:
+        case CLEAN_WAIT_LEVER:   // tap = cancel before the cycle starts
+            machine_clean_stop();
+            s_clean_stage = CLEAN_IDLE;
+            lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case CLEAN_DONE:         // tap = close the completion message
+            s_clean_stage = CLEAN_IDLE;
+            lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+            break;
+        default:                 // mid-cycle: only the STOP button acts
+            break;
+    }
+}
+
+static void clean_show_done(const char* title) {
+    machine_clean_stop();
+    s_clean_stage = CLEAN_DONE;
+    lv_label_set_text(lbl_clean_overlay_title, title);
+    lv_label_set_text(lbl_clean_overlay_sub,
+                      "Lower the brew lever.\nTap to close.");
+    lv_obj_add_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void clean_stop_btn_cb(lv_event_t *e) {
+    clean_show_done("Cleaning stopped");
 }
 
 static void ui_main_create() {
@@ -304,22 +349,52 @@ static void ui_main_create() {
     lv_obj_set_style_border_width(obj_clean_overlay, 0, 0);
     lv_obj_set_style_radius(obj_clean_overlay, 0, 0);
     lv_obj_clear_flag(obj_clean_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(obj_clean_overlay, clean_overlay_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(obj_clean_overlay, clean_overlay_click, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_clean_overlay_title = lv_label_create(obj_clean_overlay);
+    lv_label_set_text(lbl_clean_overlay_title, "Cleaning cycle");
+    lv_obj_set_style_text_font(lbl_clean_overlay_title, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(lbl_clean_overlay_title, lv_color_make(0xD4, 0x89, 0x1A), 0);
+    lv_obj_align(lbl_clean_overlay_title, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_clear_flag(lbl_clean_overlay_title, LV_OBJ_FLAG_CLICKABLE);
+
+    // Big cycles-remaining count, dead centre (visible only while running).
+    lbl_clean_count = lv_label_create(obj_clean_overlay);
+    lv_label_set_text(lbl_clean_count, "5");
+    lv_obj_set_style_text_font(lbl_clean_count, &lv_font_lm72_bold, 0);
+    lv_obj_set_style_text_color(lbl_clean_count, lv_color_white(), 0);
+    lv_obj_align(lbl_clean_count, LV_ALIGN_CENTER, 0, -6);
+    lv_obj_clear_flag(lbl_clean_count, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_clean_overlay_sub = lv_label_create(obj_clean_overlay);
+    lv_label_set_text(lbl_clean_overlay_sub,
+                      "Preparing the machine...\nKeep the lever down.");
+    lv_obj_set_style_text_font(lbl_clean_overlay_sub, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lbl_clean_overlay_sub, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_set_style_text_align(lbl_clean_overlay_sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_clean_overlay_sub, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_clear_flag(lbl_clean_overlay_sub, LV_OBJ_FLAG_CLICKABLE);
+
+    // STOP button (visible only while the cycle is running).
+    obj_clean_stop = lv_obj_create(obj_clean_overlay);
+    lv_obj_set_size(obj_clean_stop, 160, 44);
+    lv_obj_align(obj_clean_stop, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_style_radius(obj_clean_stop, 22, 0);
+    lv_obj_set_style_border_width(obj_clean_stop, 0, 0);
+    lv_obj_set_style_bg_color(obj_clean_stop, lv_color_make(0xB0, 0x2A, 0x25), 0);
+    lv_obj_set_style_pad_all(obj_clean_stop, 0, 0);
+    lv_obj_clear_flag(obj_clean_stop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_clean_stop, clean_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
     {
-        lv_obj_t *l1 = lv_label_create(obj_clean_overlay);
-        lv_label_set_text(l1, "Cleaning cycle armed");
-        lv_obj_set_style_text_font(l1, &lv_font_montserrat_32, 0);
-        lv_obj_set_style_text_color(l1, lv_color_make(0xD4, 0x89, 0x1A), 0);
-        lv_obj_align(l1, LV_ALIGN_CENTER, 0, -40);
-        lv_obj_clear_flag(l1, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t *l2 = lv_label_create(obj_clean_overlay);
-        lv_label_set_text(l2, "Lift the brew lever to start.\nTap to dismiss.");
-        lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(l2, lv_color_make(0xCC, 0xCC, 0xCC), 0);
-        lv_obj_set_style_text_align(l2, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(l2, LV_ALIGN_CENTER, 0, 24);
-        lv_obj_clear_flag(l2, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *sl = lv_label_create(obj_clean_stop);
+        lv_label_set_text(sl, "STOP");
+        lv_obj_set_style_text_font(sl, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+        lv_obj_align(sl, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(sl, LV_OBJ_FLAG_CLICKABLE);
     }
 
     // Repurposed as Gicar diagnostic line (always visible, colour-coded)
@@ -1061,18 +1136,67 @@ void ui_tick() {
         s_clean_press_ms = 0;
         lv_obj_set_style_bg_color(obj_clean, lv_color_make(0x28, 0x28, 0x28), 0);
         lv_obj_set_style_text_color(lbl_clean, lv_color_make(0xCC, 0xCC, 0xCC), 0);
-        machine_trigger_clean();
+        machine_clean_start();
         time_t now = time(nullptr);
         if (now > 1577836800UL) {  // sanity: after 2020-01-01
             settings.last_cleaning_epoch = (uint32_t)now;
             settings_save();
         }
+        s_clean_stage = CLEAN_PREP;
+        lv_label_set_text(lbl_clean_overlay_title, "Cleaning cycle");
+        lv_label_set_text(lbl_clean_overlay_sub,
+                          "Preparing the machine...\nKeep the lever down.");
+        lv_obj_add_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
         wlogf("[ui] clean cycle armed (2s hold)\n");
     }
-    // Lever lifted (or cycle running): the reminder has served its purpose.
-    if (brew_now && !lv_obj_has_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN))
-        lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    // ── Cleaning-cycle overlay state machine ────────────────────────────────────
+    switch (s_clean_stage) {
+        case CLEAN_PREP:
+            // Burst finished — now (and only now) invite the lever. Lifting it
+            // during the burst poisons the cycle (pulses landing mid-cycle
+            // abort it after one phase).
+            if (machine_clean_ready()) {
+                s_clean_stage = CLEAN_WAIT_LEVER;
+                lv_label_set_text(lbl_clean_overlay_sub,
+                                  "Lift the brew lever to start.\nTap to cancel.");
+            }
+            break;
+        case CLEAN_WAIT_LEVER:
+            // Z-frames react within ~100 ms; the R-frame brew flag is 10 s
+            // stale during the cycle (polls are deliberately slowed).
+            if (machine.z_shot_active || brew_now) {
+                s_clean_stage        = CLEAN_RUNNING;
+                s_clean_pump_prev    = true;
+                s_clean_run_start_ms = millis();
+                lv_label_set_text(lbl_clean_overlay_sub, "cycles to go");
+                lv_obj_clear_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
+            } else if (!machine_clean_active()) {
+                // Window expired before the lever was lifted.
+                s_clean_stage = CLEAN_IDLE;
+                lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+            }
+            break;
+        case CLEAN_RUNNING: {
+            // Time-based countdown; clamped so it never shows 0 while running.
+            int left = CLEAN_PHASES - (int)((millis() - s_clean_run_start_ms) / CLEAN_PHASE_MS);
+            if (left < 1) left = 1;
+            char cbuf[8];
+            snprintf(cbuf, sizeof(cbuf), "%d", left);
+            lv_label_set_text(lbl_clean_count, cbuf);
+            // End of cycle: the machine drops z_shot_active once, at the end.
+            bool pump = machine.z_shot_active;
+            if ((s_clean_pump_prev && !pump) || !machine_clean_active())
+                clean_show_done("Cleaning complete");
+            s_clean_pump_prev = pump;
+            break;
+        }
+        default:
+            break;
+    }
 
     // Brew-by-weight auto-offset learning: ~6 s after a bbw-stopped shot ends
     // (drips settled), nudge the pre-stop offset by half the target error so
@@ -1097,10 +1221,12 @@ void ui_tick() {
 
     if (!was_brew && brew_now) {
         brew_start_ms  = millis();
-        settings.shot_count++;
+        // Clean-cycle pump phases are not shots.
+        if (!machine_clean_active()) settings.shot_count++;
         scale_tare_and_start();
         bbw_stop_fired = false;
-        if (cur_screen == UI_MAIN) ui_show_timer();
+        // During a cleaning cycle the overlay is the UI — no shot timer.
+        if (cur_screen == UI_MAIN && !machine_clean_active()) ui_show_timer();
     }
 
     // Brew-by-weight auto-stop (gated by BREW_STOP_ENABLED in machine.cpp)

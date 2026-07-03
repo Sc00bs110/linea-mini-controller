@@ -49,6 +49,17 @@ void machine_init() {
     machine.setpoint_c = settings.coffee_temp_c;
 }
 
+// Backflush sequence, matching capture 07 byte-count-exactly: the app sends
+// 6 × W00E1=0x82 at 1 s intervals with normal polling, then goes NEAR-SILENT
+// for the cycle — one R-poll every ~10 s, no further pulses — while the
+// machine runs the multi-phase ~80 s cycle on its own. Chattering at the
+// machine during the cycle (normal 760 ms polls, or extra 0x82 keep-alives)
+// aborts it at the first pump-phase boundary — both were observed live
+// 2026-07-03 before the capture's quiet period was understood.
+static uint32_t s_clean_until_ms      = 0;
+static uint32_t s_clean_next_pulse_ms = 0;
+static int      s_clean_pulses_left   = 0;
+
 void machine_update() {
     // Drain Serial1, run the poll cadence, and parse any R/Z frames.
     gicar_process();
@@ -110,6 +121,30 @@ void machine_update() {
         if (machine.z_shot_active) {
             machine.brew_active = true;
             s_brew_false_ms     = 0;
+        }
+    }
+
+    // ── Clean cycle: 6-pulse burst, then radio silence until the window ends ──
+    if (s_clean_until_ms != 0) {
+        if (millis() >= s_clean_until_ms) {
+            machine_clean_stop();
+        } else if (s_clean_pulses_left > 0) {
+            // A pulse landing on an already-running cycle aborts it after the
+            // first pump phase (observed live: lever lifted 2 s into the
+            // burst → cycle died). If the brew starts early, drop the rest.
+            if (machine.brew_active) {
+                s_clean_pulses_left = 0;
+                gicar_set_poll_period(10000);
+                wlogf("[machine] clean: lever up mid-burst — remaining pulses dropped\n");
+            } else if (millis() >= s_clean_next_pulse_ms) {
+                s_clean_next_pulse_ms = millis() + 1000;
+                s_clean_pulses_left--;
+                gicar_write_byte(0x00E1, 0x82);
+                if (s_clean_pulses_left == 0) {
+                    gicar_set_poll_period(10000);  // app-observed quiet period
+                    wlogf("[machine] clean burst sent — ready for the lever\n");
+                }
+            }
         }
     }
 
@@ -176,10 +211,27 @@ void machine_set_preinfusion_dur(uint8_t v) {
     wlogf("[machine] set_preinfusion_dur=%u\n", v);
 }
 
-void machine_trigger_clean() {
-    // Register 0x00E1: 0x82 pulse. The caller must repeat at ~1 Hz for the full
-    // ~130 s clean cycle; a single write does not run the cycle to completion.
-    gicar_write_byte(0x00E1, 0x82);
+void machine_clean_start() {
+    s_clean_until_ms      = millis() + 135000;
+    s_clean_pulses_left   = 6;
+    s_clean_next_pulse_ms = 0;   // first pulse on the next update
+    wlogf("[machine] clean cycle started (6-pulse burst, then quiet)\n");
+}
+
+void machine_clean_stop() {
+    if (s_clean_until_ms != 0) wlogf("[machine] clean cycle stopped\n");
+    s_clean_until_ms    = 0;
+    s_clean_pulses_left = 0;
+    gicar_set_poll_period(0);   // restore the normal 760 ms cadence
+}
+
+bool machine_clean_active() {
+    return s_clean_until_ms != 0;
+}
+
+bool machine_clean_ready() {
+    // Burst finished — safe to invite the lever.
+    return s_clean_until_ms != 0 && s_clean_pulses_left == 0;
 }
 
 void machine_set_standby(bool standby) {

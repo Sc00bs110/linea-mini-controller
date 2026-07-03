@@ -56,6 +56,9 @@ float          gicar_r_setpoint();          // setpoint from boot config read (�
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 void gicar_write(uint16_t addr, const uint8_t* data, uint16_t len);
+// Override the R-poll cadence (0 = restore the 760 ms default). The factory
+// app polls only ~every 10 s during a backflush cycle.
+void gicar_set_poll_period(uint32_t ms);
 void gicar_read_req(uint16_t addr, uint16_t req_len);
 
 // ── Diagnostics ──────────────────────────────────────────────────────────────

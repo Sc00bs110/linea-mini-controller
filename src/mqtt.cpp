@@ -62,7 +62,7 @@ static void on_msg(const char* topic, byte* payload, unsigned int len) {
         machine_set_standby(go_standby);
 
     } else if (strcmp(topic, MQTT_CMD_CLEAN) == 0) {
-        machine_trigger_clean();
+        machine_clean_start();
         time_t now = time(nullptr);
         if (now > 1577836800UL) {  // sanity: after 2020-01-01
             settings.last_cleaning_epoch = (uint32_t)now;
