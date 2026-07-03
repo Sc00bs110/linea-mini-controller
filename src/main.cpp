@@ -150,6 +150,12 @@ static void wifi_tick() {
 
 void setup() {
     Serial.begin(115200);
+    // Never block on USB CDC writes: with no host draining the port, the
+    // default tx timeout stalls loop() for seconds per burst of log prints,
+    // freezing GICAR polling (shot timer jerky / brew stop missed). Drop
+    // output instead — confirmed via HA history 2026-07-03: machine_online
+    // flapped 4s-on/10s-off whenever no serial monitor was attached.
+    Serial.setTxTimeoutMs(0);
     delay(100);
 
     // Panel init + lv_init() + LVGL display-driver registration. Must run before
