@@ -16,14 +16,14 @@
 
 extern uint32_t wifi_retry_count();
 
-// Custom 64px Montserrat subset (digits, '.', '-', 'C', degree), generated with
-// lv_font_conv for an enlarged lbl_temp. Not wired in yet -- both this and an
-// earlier transform_zoom attempt left lbl_temp blank on real hardware; reverted
-// to lv_font_montserrat_48 (last confirmed-good) pending proper diagnosis after
-// Phase 4 touch bring-up. Defined in src/fonts/lv_font_montserrat_64_temp.c.
-LV_FONT_DECLARE(lv_font_montserrat_64_temp);
+// Custom Montserrat BOLD subset (space, digits, '.', '-', 'C', 'g', 's',
+// degree) for the big temp and shot-time readouts. Generated 2026-07-03:
+// fontTools.varLib.instancer wght=700, then npx lv_font_conv --size 72
+// --bpp 4 --range 0x20,0x2D,0x2E,0x30-0x39,0x43,0x67,0x73,0xB0.
+// Defined in src/fonts/lv_font_lm72_bold.c.
+LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.15"
+#define FW_VERSION "v0.16"
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -41,20 +41,19 @@ static void settings_row_click_cb(lv_event_t *e);
 enum SettingsItem {
     SI_TEMP,         // 0  88.0–96.0°C, step 0.5
     SI_BREW_WEIGHT,  // 1  20–60 g, step 1 g
-    SI_CLEAN,        // 2  action — triggers clean cycle
-    SI_PREINFUSION,  // 3  OFF / 0.5–10.0 s, step 0.5
-    SI_STANDBY,      // 4  OFF / 15 / 30 / 60 min
-    SI_PRESTOP,      // 5  0.0–8.0 g, step 0.5 g
-    SI_STEAM,        // 6  ON / OFF
-    SI_WIFI,         // 7  navigate → WiFi status screen
-    SI_BACK,         // 8  action — save + return to main
-    SI_COUNT         // 9
+    SI_PREINFUSION,  // 2  OFF / 0.5–10.0 s, step 0.5
+    SI_STANDBY,      // 3  OFF / 15 / 30 / 60 min
+    SI_PRESTOP,      // 4  0.0–8.0 g, step 0.5 g
+    SI_STEAM,        // 5  ON / OFF
+    SI_WIFI,         // 6  navigate → WiFi status screen
+    SI_BACK,         // 7  action — save + return to main
+    SI_COUNT         // 8
 };
+// Clean cycle moved to a hold-to-start button on the Main screen (v0.16).
 
 static const char *item_names[SI_COUNT] = {
     "Coffee temp",
     "Brew weight",
-    "Clean cycle",
     "Pre-infusion",
     "Auto-standby",
     "Pre-stop offset",
@@ -113,6 +112,73 @@ static lv_obj_t *lbl_shots;
 static lv_obj_t *lbl_scale_weight;
 static lv_obj_t *lbl_status;
 static lv_obj_t *lbl_hint;
+static lv_obj_t *lbl_target_val;
+static lv_obj_t *lbl_settemp_val;
+static lv_obj_t *obj_clean;
+static lv_obj_t *lbl_clean;
+static lv_obj_t *obj_clean_overlay;
+
+// Edge adjusters (Main): NVS writes are debounced so a burst of arrow taps
+// commits once, 3 s after the last tap (see ui_tick()). The set-temp commit
+// also sends the new setpoint to the machine at that point — never per-tap.
+static uint32_t s_target_touched_ms  = 0;
+static uint32_t s_settemp_touched_ms = 0;
+
+// CLEAN hold-to-start state (see ui_tick()).
+static uint32_t s_clean_press_ms = 0;
+
+static void target_show() {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%.0f g", settings.brew_target_g);
+    lv_label_set_text(lbl_target_val, buf);
+}
+
+static void target_adjust(float delta) {
+    settings.brew_target_g += delta;
+    if (settings.brew_target_g < 20.0f) settings.brew_target_g = 20.0f;
+    if (settings.brew_target_g > 60.0f) settings.brew_target_g = 60.0f;
+    s_target_touched_ms = millis();
+    target_show();
+}
+
+static void target_up_cb(lv_event_t *e)   { target_adjust(+1.0f); }
+static void target_down_cb(lv_event_t *e) { target_adjust(-1.0f); }
+
+static void settemp_show() {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%.1f\xc2\xb0", settings.coffee_temp_c);
+    lv_label_set_text(lbl_settemp_val, buf);
+}
+
+static void settemp_adjust(float delta) {
+    settings.coffee_temp_c += delta;
+    if (settings.coffee_temp_c < 88.0f) settings.coffee_temp_c = 88.0f;
+    if (settings.coffee_temp_c > 96.0f) settings.coffee_temp_c = 96.0f;
+    s_settemp_touched_ms = millis();
+    settemp_show();
+}
+
+static void settemp_up_cb(lv_event_t *e)   { settemp_adjust(+0.5f); }
+static void settemp_down_cb(lv_event_t *e) { settemp_adjust(-0.5f); }
+
+// CLEAN pill: PRESSED starts the 2 s hold window (checked in ui_tick());
+// releasing early cancels. The pill turns amber while armed.
+static void clean_press_cb(lv_event_t *e) {
+    lv_event_code_t c = lv_event_get_code(e);
+    if (c == LV_EVENT_PRESSED) {
+        s_clean_press_ms = millis();
+        lv_obj_set_style_bg_color(obj_clean, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_obj_set_style_text_color(lbl_clean, lv_color_black(), 0);
+    } else {  // RELEASED / PRESS_LOST
+        s_clean_press_ms = 0;
+        lv_obj_set_style_bg_color(obj_clean, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_text_color(lbl_clean, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    }
+}
+
+static void clean_overlay_hide(lv_event_t *e) {
+    lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+}
 
 static void ui_main_create() {
     scr_main = lv_obj_create(NULL);
@@ -120,11 +186,12 @@ static void ui_main_create() {
     lv_obj_clear_flag(scr_main, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_all(scr_main, 0, 0);
 
+    // Actual temperature, bold, centred between the two edge adjusters.
     lbl_temp = lv_label_create(scr_main);
     lv_label_set_text(lbl_temp, "--.-\xc2\xb0" "C");
-    lv_obj_set_style_text_font(lbl_temp, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_font(lbl_temp, &lv_font_lm72_bold, 0);
     lv_obj_set_style_text_color(lbl_temp, lv_color_make(0xD4, 0x89, 0x1A), 0);
-    lv_obj_align(lbl_temp, LV_ALIGN_LEFT_MID, 8, -12);
+    lv_obj_align(lbl_temp, LV_ALIGN_TOP_MID, 0, 44);
 
     obj_steam = lv_obj_create(scr_main);
     lv_obj_set_size(obj_steam, 120, 32);
@@ -144,26 +211,116 @@ static void ui_main_create() {
     lv_label_set_text(lbl_brew, "BREWING");
     lv_obj_set_style_text_font(lbl_brew, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_brew, lv_color_make(0x5C, 0xB8, 0x5C), 0);
-    lv_obj_align(lbl_brew, LV_ALIGN_RIGHT_MID, -12, -60);
+    lv_obj_align(lbl_brew, LV_ALIGN_CENTER, 0, 18);
     lv_obj_add_flag(lbl_brew, LV_OBJ_FLAG_HIDDEN);
 
     lbl_shots = lv_label_create(scr_main);
     lv_label_set_text(lbl_shots, "0 shots");
     lv_obj_set_style_text_font(lbl_shots, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_shots, lv_color_make(0x80, 0x80, 0x80), 0);
-    lv_obj_align(lbl_shots, LV_ALIGN_RIGHT_MID, -12, -20);
+    lv_obj_align(lbl_shots, LV_ALIGN_CENTER, 0, 52);
 
     lbl_scale_weight = lv_label_create(scr_main);
     lv_label_set_text(lbl_scale_weight, "");
     lv_obj_set_style_text_font(lbl_scale_weight, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_scale_weight, lv_color_make(0x3A, 0x80, 0x3A), 0);
-    lv_obj_align(lbl_scale_weight, LV_ALIGN_RIGHT_MID, -12, 24);
+    lv_obj_align(lbl_scale_weight, LV_ALIGN_CENTER, 0, 82);
 
     lbl_status = lv_label_create(scr_main);
     lv_label_set_text(lbl_status, "WiFi: connecting...");
     lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_status, lv_color_make(0x80, 0x80, 0x80), 0);
     lv_obj_align(lbl_status, LV_ALIGN_BOTTOM_LEFT, 8, -22);
+
+    // Edge adjusters: ▲ / value / ▼ columns flush against each screen border,
+    // vertically centred. Left = coffee setpoint (0.5° steps), right = brew
+    // target weight (1 g steps).
+    auto make_arrow = [&](const char* sym, lv_event_cb_t cb, lv_align_t align, int x_ofs, int y_ofs) {
+        lv_obj_t *btn = lv_obj_create(scr_main);
+        lv_obj_set_size(btn, 64, 44);
+        lv_obj_align(btn, align, x_ofs, y_ofs);
+        lv_obj_set_style_bg_color(btn, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_radius(btn, 6, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, sym);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+        return btn;
+    };
+    auto make_col_val = [&](lv_align_t align, int x_ofs) {
+        lv_obj_t *lbl = lv_label_create(scr_main);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+        lv_obj_set_width(lbl, 64);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(lbl, align, x_ofs, 0);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+        return lbl;
+    };
+
+    make_arrow(LV_SYMBOL_UP,   target_up_cb,    LV_ALIGN_RIGHT_MID, -8, -64);
+    make_arrow(LV_SYMBOL_DOWN, target_down_cb,  LV_ALIGN_RIGHT_MID, -8,  64);
+    lbl_target_val = make_col_val(LV_ALIGN_RIGHT_MID, -8);
+    target_show();
+
+    make_arrow(LV_SYMBOL_UP,   settemp_up_cb,   LV_ALIGN_LEFT_MID, 8, -64);
+    make_arrow(LV_SYMBOL_DOWN, settemp_down_cb, LV_ALIGN_LEFT_MID, 8,  64);
+    lbl_settemp_val = make_col_val(LV_ALIGN_LEFT_MID, 8);
+    settemp_show();
+
+    // CLEAN: hold 2 s to arm the machine's cleaning cycle (fires in ui_tick()).
+    obj_clean = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_clean, 120, 36);
+    lv_obj_align(obj_clean, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_set_style_radius(obj_clean, 18, 0);
+    lv_obj_set_style_border_width(obj_clean, 0, 0);
+    lv_obj_set_style_bg_color(obj_clean, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_pad_all(obj_clean, 0, 0);
+    lv_obj_clear_flag(obj_clean, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_clean, clean_press_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(obj_clean, clean_press_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(obj_clean, clean_press_cb, LV_EVENT_PRESS_LOST, NULL);
+    lbl_clean = lv_label_create(obj_clean);
+    lv_label_set_text(lbl_clean, "CLEAN");
+    lv_obj_set_style_text_font(lbl_clean, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_clean, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_align(lbl_clean, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(lbl_clean, LV_OBJ_FLAG_CLICKABLE);
+
+    // Lever-reminder overlay shown once the CLEAN hold completes. Tap to
+    // dismiss; also auto-dismisses when the cycle starts (see ui_tick()).
+    obj_clean_overlay = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_clean_overlay, 480, 320);
+    lv_obj_set_pos(obj_clean_overlay, 0, 0);
+    lv_obj_set_style_bg_color(obj_clean_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(obj_clean_overlay, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(obj_clean_overlay, 0, 0);
+    lv_obj_set_style_radius(obj_clean_overlay, 0, 0);
+    lv_obj_clear_flag(obj_clean_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_clean_overlay, clean_overlay_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+    {
+        lv_obj_t *l1 = lv_label_create(obj_clean_overlay);
+        lv_label_set_text(l1, "Cleaning cycle armed");
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_32, 0);
+        lv_obj_set_style_text_color(l1, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_obj_align(l1, LV_ALIGN_CENTER, 0, -40);
+        lv_obj_clear_flag(l1, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *l2 = lv_label_create(obj_clean_overlay);
+        lv_label_set_text(l2, "Lift the brew lever to start.\nTap to dismiss.");
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(l2, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+        lv_obj_set_style_text_align(l2, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(l2, LV_ALIGN_CENTER, 0, 24);
+        lv_obj_clear_flag(l2, LV_OBJ_FLAG_CLICKABLE);
+    }
 
     // Repurposed as Gicar diagnostic line (always visible, colour-coded)
     lbl_hint = lv_label_create(scr_main);
@@ -212,6 +369,15 @@ static void ui_main_update() {
     char sbuf[16];
     snprintf(sbuf, sizeof(sbuf), "%u shots", (unsigned)settings.shot_count);
     lv_label_set_text(lbl_shots, sbuf);
+
+    target_show();   // tracks changes made on the Settings screen too
+    settemp_show();
+
+    // CLEAN is hidden while a brew is running (and while the machine is away).
+    if (get_brew_active())
+        lv_obj_add_flag(obj_clean, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_clear_flag(obj_clean, LV_OBJ_FLAG_HIDDEN);
 
     if (scale_connected()) {
         char wbuf[16];
@@ -268,7 +434,17 @@ static void ui_main_update() {
     } else {
         lv_obj_set_style_text_color(lbl_hint, lv_color_make(0xB0, 0x55, 0x55), 0);  // dark red — no data at all
     }
-    lv_obj_clear_flag(lbl_hint, LV_OBJ_FLAG_HIDDEN);
+
+    // Both diagnostic lines only appear when something is actually wrong
+    // (WiFi enabled but down, MQTT down, machine link down, or no frames).
+    bool healthy = wifi_ok && mqtt_ok && machine.connected && frms > 0;
+    if (healthy) {
+        lv_obj_add_flag(lbl_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lbl_hint,   LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(lbl_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lbl_hint,   LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // ─── TIMER SCREEN ─────────────────────────────────────────────────────────────
@@ -289,7 +465,7 @@ static void ui_timer_create() {
 
     lbl_shot_time = lv_label_create(scr_timer);
     lv_label_set_text(lbl_shot_time, "0.0 s");
-    lv_obj_set_style_text_font(lbl_shot_time, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_font(lbl_shot_time, &lv_font_lm72_bold, 0);
     lv_obj_set_style_text_color(lbl_shot_time, lv_color_white(), 0);
     lv_obj_align(lbl_shot_time, LV_ALIGN_LEFT_MID, 8, -12);
 
@@ -328,9 +504,9 @@ static void ui_timer_create() {
     lv_obj_add_flag(weight_bar, LV_OBJ_FLAG_HIDDEN);
 
     lbl_target_weight = lv_label_create(scr_timer);
-    lv_label_set_text(lbl_target_weight, "target 36g");
-    lv_obj_set_style_text_font(lbl_target_weight, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_target_weight, lv_color_make(0x70, 0x70, 0x70), 0);
+    lv_label_set_text(lbl_target_weight, "target 36g  (-3.0g)");
+    lv_obj_set_style_text_font(lbl_target_weight, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lbl_target_weight, lv_color_make(0x90, 0x90, 0x90), 0);
     lv_obj_align(lbl_target_weight, LV_ALIGN_BOTTOM_RIGHT, -8, -6);
     lv_obj_add_flag(lbl_target_weight, LV_OBJ_FLAG_HIDDEN);
 
@@ -389,8 +565,9 @@ static void ui_timer_update() {
         lv_bar_set_range(weight_bar, 0, (int)(settings.brew_target_g * 10));
         lv_bar_set_value(weight_bar, (int)(w * 10), LV_ANIM_OFF);
 
-        char targetbuf[20];
-        snprintf(targetbuf, sizeof(targetbuf), "target %.0fg", settings.brew_target_g);
+        char targetbuf[32];
+        snprintf(targetbuf, sizeof(targetbuf), "target %.0fg  (-%.1fg)",
+                 settings.brew_target_g, settings.prestop_offset_g);
         lv_label_set_text(lbl_target_weight, targetbuf);
 
         float ratio = (settings.brew_target_g > 0) ? (w / settings.brew_target_g) : 0;
@@ -444,8 +621,6 @@ static const char* get_item_val(int i) {
             snprintf(buf, sizeof(buf), "%.0f g", settings.brew_target_g); break;
         case SI_PRESTOP:
             snprintf(buf, sizeof(buf), "%.1f g", settings.prestop_offset_g); break;
-        case SI_CLEAN:
-            snprintf(buf, sizeof(buf), "Run"); break;
         case SI_BACK:
             buf[0] = '\0'; break;
         default:
@@ -469,7 +644,7 @@ static void settings_draw() {
             sel ? lv_color_white() : lv_color_make(0x90, 0x90, 0x90), 0);
 
         char vbuf[32];
-        bool is_value_item = (i != SI_WIFI && i != SI_CLEAN && i != SI_BACK);
+        bool is_value_item = (i != SI_WIFI && i != SI_BACK);
         if (ed && is_value_item) {
             snprintf(vbuf, sizeof(vbuf), "< %s >", get_item_val(i));
             lv_obj_set_style_text_color(settings_val_lbl[i], lv_color_make(0xF0, 0xA8, 0x30), 0);
@@ -564,17 +739,6 @@ static void settings_select() {
         case SI_WIFI:
             ui_show_wifi();
             return;
-        case SI_CLEAN:
-            machine_trigger_clean();
-            lv_label_set_text(lbl_settings_hdr, "Cleaning...");
-            {
-                time_t now = time(nullptr);
-                if (now > 1577836800UL) {
-                    settings.last_cleaning_epoch = (uint32_t)now;
-                    settings_save();
-                }
-            }
-            return;
         case SI_BACK:
             settings_save();
             settings_sel  = 0;
@@ -615,7 +779,7 @@ static void settings_edit_increment() {
             settings.prestop_offset_g += 0.5f;
             if (settings.prestop_offset_g > 8.0f) settings.prestop_offset_g = 0.0f;
             break;
-        // SI_WIFI, SI_CLEAN, SI_BACK: no increment
+        // SI_WIFI, SI_BACK: no increment
     }
     settings_draw();
 }
@@ -640,14 +804,6 @@ static void wifi_ap_btn_cb(lv_event_t *e) {
     wlogf("[ap] setup button pressed\n");
     wifi_ap_start();
     ui_show_wifi_ap();
-}
-
-// TEMP diagnostic: log where taps land on the WiFi screen (screen-level
-// CLICKED fires for any tap not consumed by a child).
-static void wifi_scr_click_dbg(lv_event_t *e) {
-    lv_point_t p;
-    lv_indev_get_point(lv_indev_get_act(), &p);
-    wlogf("[ui] wifi screen tap at x=%d y=%d\n", (int)p.x, (int)p.y);
 }
 
 static void ui_wifi_create() {
@@ -695,10 +851,6 @@ static void ui_wifi_create() {
     make_row(76,  "Network:",  &lbl_wifi_ssid);
     make_row(114, "IP:",       &lbl_wifi_ip);
     make_row(152, "Signal:",   &lbl_wifi_rssi);
-
-    // TEMP diagnostic: see wifi_scr_click_dbg above.
-    lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scr_wifi, wifi_scr_click_dbg, LV_EVENT_CLICKED, NULL);
 
     // AP Setup button
     lv_obj_t *btn_ap = lv_obj_create(scr_wifi);
@@ -859,18 +1011,6 @@ static void settings_row_click_cb(lv_event_t *e) {
         ui_show_wifi();
         return;
     }
-    if (idx == SI_CLEAN) {
-        machine_trigger_clean();
-        lv_label_set_text(lbl_settings_hdr, "Cleaning...");
-        {
-            time_t now = time(nullptr);
-            if (now > 1577836800UL) {
-                settings.last_cleaning_epoch = (uint32_t)now;
-                settings_save();
-            }
-        }
-        return;
-    }
     if (idx == SI_BACK) {
         settings_save();
         settings_sel  = 0;
@@ -900,7 +1040,60 @@ void ui_tick() {
     demo_update();
     button_update();
 
+    // Debounced NVS commit for the Main-screen target-weight arrows.
+    if (s_target_touched_ms != 0 && millis() - s_target_touched_ms >= 3000) {
+        s_target_touched_ms = 0;
+        settings_save();
+    }
+    // Set-temp arrows: commit to NVS and send the new setpoint to the machine
+    // once, 3 s after the last tap — never per-tap (each send is a real GICAR
+    // write to the boiler controller).
+    if (s_settemp_touched_ms != 0 && millis() - s_settemp_touched_ms >= 3000) {
+        s_settemp_touched_ms = 0;
+        settings_save();
+        machine_set_temp(settings.coffee_temp_c);
+    }
+
     bool brew_now = get_brew_active();
+
+    // CLEAN hold-to-start: fires once the pill has been held for 2 s.
+    if (s_clean_press_ms != 0 && millis() - s_clean_press_ms >= 2000 && !brew_now) {
+        s_clean_press_ms = 0;
+        lv_obj_set_style_bg_color(obj_clean, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_text_color(lbl_clean, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+        machine_trigger_clean();
+        time_t now = time(nullptr);
+        if (now > 1577836800UL) {  // sanity: after 2020-01-01
+            settings.last_cleaning_epoch = (uint32_t)now;
+            settings_save();
+        }
+        lv_obj_clear_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+        wlogf("[ui] clean cycle armed (2s hold)\n");
+    }
+    // Lever lifted (or cycle running): the reminder has served its purpose.
+    if (brew_now && !lv_obj_has_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    // Brew-by-weight auto-offset learning: ~6 s after a bbw-stopped shot ends
+    // (drips settled), nudge the pre-stop offset by half the target error so
+    // the next shot lands closer. Clamped to the offset's settings range.
+    static uint32_t s_bbw_settle_ms = 0;
+    if (s_bbw_settle_ms != 0 && millis() - s_bbw_settle_ms >= 6000) {
+        s_bbw_settle_ms = 0;
+        if (scale_connected()) {
+            float final_g = scale_weight();
+            float err = final_g - settings.brew_target_g;
+            if (final_g > 5.0f && fabsf(err) <= 10.0f) {
+                float o = settings.prestop_offset_g + 0.5f * err;
+                if (o < 0.0f) o = 0.0f;
+                if (o > 8.0f) o = 8.0f;
+                wlogf("[bbw] auto-offset: final=%.1fg target=%.0fg offset %.1f -> %.1f\n",
+                      final_g, settings.brew_target_g, settings.prestop_offset_g, o);
+                settings.prestop_offset_g = o;
+                settings_save();
+            }
+        }
+    }
 
     if (!was_brew && brew_now) {
         brew_start_ms  = millis();
@@ -923,6 +1116,8 @@ void ui_tick() {
     if (was_brew && !brew_now) {
         brew_end_ms    = millis();
         returning_brew = true;
+        // Arm auto-offset learning only for shots this firmware stopped.
+        if (bbw_stop_fired && scale_connected()) s_bbw_settle_ms = millis();
     }
     if (returning_brew && (millis() - brew_end_ms) >= 3000) {
         returning_brew = false;

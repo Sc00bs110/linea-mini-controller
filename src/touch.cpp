@@ -30,7 +30,12 @@
 // ── GT911 register addresses (16-bit, big-endian on the wire) ───────────────
 static const uint16_t GT911_REG_PRODUCT_ID = 0x8140;  // 4 bytes, ASCII "911\0"
 static const uint16_t GT911_REG_STATUS     = 0x814E;  // status / touch count
-static const uint16_t GT911_REG_POINT0     = 0x8150;  // first touch-point block
+// Point-1 block starts at 0x814F: [track_id, x_lo, x_hi, y_lo, y_hi, ...].
+// (Was 0x8150, which is already x_lo — parsing that as track_id shifted every
+// byte by one, making both coordinates read as garbage that clamped to the
+// bottom-right corner pixel 479,319 on every tap. Found via the WiFi-screen
+// tap logger, 2026-07-03.)
+static const uint16_t GT911_REG_POINT0     = 0x814F;  // first touch-point block
 
 static const uint8_t GT911_STATUS_READY = 0x80;  // bit7: coordinate buffer ready
 static const uint8_t GT911_COUNT_MASK   = 0x0F;  // low nibble: number of points
