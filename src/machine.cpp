@@ -162,15 +162,24 @@ void machine_update() {
     }
     prev_brew = machine.brew_active;
 
-    // ── Setpoint pickup ──────────────────────────────────────────────────────────
-    // The boot config read populates gicar_r_setpoint() shortly after init. Latch
-    // the first sane value (>50 °C filters the zero/uninitialised state) so the UI
-    // tracks the machine's real setpoint instead of the NVS fallback.
-    static bool setpoint_loaded = false;
-    if (!setpoint_loaded && gicar_r_setpoint() > 50.0f) {
+    // ── Setpoint tracking ────────────────────────────────────────────────────────
+    // Re-read the 0x0000 config block every 60 s while the machine is idle so the
+    // GICAR's REAL setpoint register stays visible (diagnosis: boiler ran 96-100°C
+    // on 2026-07-04 with our target at 93 and no writes from us — needed to see
+    // whether the machine itself was targeting high). Never send during a brew or
+    // the cleaning cycle's quiet period: extra traffic aborts a running backflush.
+    static uint32_t s_cfg_req_ms = 0;
+    if (machine.connected && !machine.brew_active && !machine.z_shot_active &&
+        !machine_clean_active() && millis() - s_cfg_req_ms >= 60000) {
+        s_cfg_req_ms = millis();
+        gicar_read_req(0x0000, 0x0020);
+    }
+
+    // Latch any sane value (>50 °C filters the zero/uninitialised state) so the UI
+    // and MQTT track the machine's real setpoint instead of the NVS fallback.
+    if (gicar_r_setpoint() > 50.0f && gicar_r_setpoint() != machine.setpoint_c) {
         machine.setpoint_c = gicar_r_setpoint();
-        setpoint_loaded = true;
-        wlogf("[machine] setpoint loaded=%.1f\n", machine.setpoint_c);
+        wlogf("[machine] setpoint now %.1f\n", machine.setpoint_c);
     }
 
     // ── Disconnect timeout ───────────────────────────────────────────────────────

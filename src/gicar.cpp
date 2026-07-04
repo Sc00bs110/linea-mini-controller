@@ -31,6 +31,9 @@
 static const int      R_FRAME_LEN   = GICAR_R_FRAME_LEN;  // 81
 static const int      Z_FRAME_LEN   = GICAR_Z_FRAME_LEN;  // 54
 static const int      X_FRAME_LEN   = 11;                 // "X00000001D9"
+// Config-block read response (0x0000/0x0020): "R" + addr(4) + len(4) +
+// 2*32 hex + cs(2). Carries the machine's live setpoint at payload[7..8].
+static const int      R_CFG_FRAME_LEN = 9 + 2 * 0x20 + 2; // 75
 // 760 ms matches BOTH validated references (the WROOM build that worked
 // end-to-end and the C6-era rewrite) and the factory gateway's own observed
 // cadence in the sniffer captures. Our port briefly used 100 ms, which
@@ -193,6 +196,26 @@ static int _build_write(char* out, int cap,
 //   payload[27]      boiler flags bitmask
 //   payload[28..29]  coffee temp, uint16 BE / 10.0 °C
 static void _parse_r_frame(const char* buf, int len) {
+    // Config-block frame (0x0000/0x0020, 75 chars): only the setpoint is of
+    // interest. Requested periodically by machine_update() via gicar_read_req()
+    // so the machine's REAL setpoint register stays visible after boot.
+    if (len == R_CFG_FRAME_LEN && buf[0] == 'R') {
+        uint8_t want = _cs(buf, len - 2);
+        uint8_t got  = _hex2(buf[len - 2], buf[len - 1]);
+        if (want != got) {
+            wlogf("[gicar] cfg-frame checksum %02X!=%02X\n", got, want);
+            return;
+        }
+        uint8_t hi = _hex2(buf[9 + 7 * 2], buf[9 + 7 * 2 + 1]);
+        uint8_t lo = _hex2(buf[9 + 8 * 2], buf[9 + 8 * 2 + 1]);
+        float sp = (float)(((uint16_t)hi << 8) | lo) / 10.0f;
+        if (sp != _r_setpoint) {
+            wlogf("[gicar] machine setpoint=%.1f (was %.1f)\n", sp, _r_setpoint);
+        }
+        _r_setpoint = sp;
+        return;
+    }
+
     if (len != R_FRAME_LEN || buf[0] != 'R') {
         wlogf("[gicar] R-frame bad header len=%d c=%c\n", len, buf[0]);
         return;
@@ -403,6 +426,13 @@ void gicar_process() {
 
         if (_rxlen < GICAR_BUF_SIZE - 1) {
             _rxbuf[_rxlen++] = c;
+            // R frames vary by requested block: once the 4-char len field is
+            // in, retarget the expected total (0x20 config read vs 0x23 poll).
+            if (_rxbuf[0] == 'R' && _rxlen == 9) {
+                uint16_t plen = (uint16_t)((_hex2(_rxbuf[5], _rxbuf[6]) << 8) |
+                                            _hex2(_rxbuf[7], _rxbuf[8]));
+                if (plen == 0x20) _expect_len = R_CFG_FRAME_LEN;
+            }
         } else {
             // Overflow guard — should never hit for valid frames; resync.
             _rxlen      = 0;

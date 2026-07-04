@@ -23,7 +23,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.17"
+#define FW_VERSION "v0.18"
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -465,12 +465,18 @@ static void ui_main_update() {
         lv_label_set_text(lbl_scale_weight, "");
     }
 
-    // ── Connectivity dot: green when WiFi + MQTT are both up, dark otherwise ────
+    // ── Connectivity dot: green = WiFi + MQTT + machine all up; amber = network
+    // up but machine off/unreachable; dark = network down.
     bool wifi_ok = (WiFi.status() == WL_CONNECTED);
     bool mqtt_ok = mqtt_connected();
-    lv_obj_set_style_bg_color(led_status,
-        (wifi_ok && mqtt_ok) ? lv_color_make(0x2E, 0xC8, 0x4B)
-                             : lv_color_make(0x35, 0x35, 0x35), 0);
+    lv_color_t dot;
+    if (wifi_ok && mqtt_ok && machine.connected)
+        dot = lv_color_make(0x2E, 0xC8, 0x4B);
+    else if (wifi_ok && mqtt_ok)
+        dot = lv_color_make(0xD4, 0x89, 0x1A);
+    else
+        dot = lv_color_make(0x35, 0x35, 0x35);
+    lv_obj_set_style_bg_color(led_status, dot, 0);
 
     // FW version, always visible next to the dot.
     lv_label_set_text(lbl_hint, FW_VERSION);

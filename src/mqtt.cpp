@@ -140,7 +140,16 @@ static void publish_discovery() {
         "\"cmd_t\":\"" MQTT_CMD_CLEAN "\",\"pl_prs\":\"PRESS\","
         AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (9 entities)\n");
+    // The machine's OWN setpoint register (0x0007), re-read every 60 s —
+    // distinct from Target Temp, which is only our stored/commanded value.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/machine_setpoint/config",
+        "{\"name\":\"Machine Setpoint\",\"uniq_id\":\"lm_mini_machine_setpoint\","
+        "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.machine_setpoint}}\","
+        "\"dev_cla\":\"temperature\",\"unit_of_meas\":\"\\u00b0C\","
+        "\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
+
+    wlogf("[mqtt] HA discovery published (10 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -162,14 +171,15 @@ static void publish_state() {
     bool in_frame; int rxlen;
     gicar_rx_state(&in_frame, &rxlen);
 
-    char state[352];
+    char state[384];
     snprintf(state, sizeof(state),
-        "{\"temp\":%.1f,\"target_temp\":%.1f,\"brew\":\"%s\","
+        "{\"temp\":%.1f,\"target_temp\":%.1f,\"machine_setpoint\":%.1f,\"brew\":\"%s\","
         "\"steam\":\"%s\",\"standby\":\"%s\",\"shots\":%u,\"last_clean\":\"%s\","
         "\"machine\":\"%s\",\"scale\":\"%s\",\"weight\":%.1f,"
         "\"rx\":%lu,\"in_frame\":%d,\"rxlen\":%d,\"dbg\":\"%s\"}",
         machine.coffee_temp_c,
         settings.coffee_temp_c,
+        machine.setpoint_c,
         machine.brew_active   ? "ON" : "OFF",
         machine.steam_active  ? "ON" : "OFF",
         machine.standby       ? "ON" : "OFF",
