@@ -23,17 +23,19 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.20"
+#define FW_VERSION "v0.21"
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
 static void ui_show_timer();
 static void ui_show_settings();
+static void ui_show_sched();
 static void ui_show_wifi();
 static void ui_show_wifi_ap();
 static void settings_draw();
 static void settings_edit_increment();
 static void menu_long_press_cb(lv_event_t *e);
+static void sleep_wake_cb(lv_event_t *e);
 static void timer_click_cb(lv_event_t *e);
 static void settings_row_click_cb(lv_event_t *e);
 
@@ -42,11 +44,13 @@ enum SettingsItem {
     SI_BREW_WEIGHT,  // 0  20–60 g, step 1 g
     SI_PREINFUSION,  // 1  OFF / 0.5–10.0 s, step 0.5
     SI_STANDBY,      // 2  OFF / 15 / 30 / 60 min
-    SI_PRESTOP,      // 3  0.0–8.0 g, step 0.5 g
-    SI_STEAM,        // 4  ON / OFF
-    SI_WIFI,         // 5  navigate → WiFi status screen
-    SI_BACK,         // 6  action — save + return to main
-    SI_COUNT         // 7
+    SI_SCHEDULE,     // 3  navigate → standby schedule screen
+    SI_TIMEZONE,     // 4  UTC offset, ±30 min steps
+    SI_PRESTOP,      // 5  0.0–8.0 g, step 0.5 g
+    SI_STEAM,        // 6  ON / OFF
+    SI_WIFI,         // 7  navigate → WiFi status screen
+    SI_BACK,         // 8  action — save + return to main
+    SI_COUNT         // 9
 };
 // Clean cycle moved to a hold-to-start button on the Main screen (v0.16);
 // coffee temp moved to the main-screen edge adjuster (v0.20).
@@ -55,6 +59,8 @@ static const char *item_names[SI_COUNT] = {
     "Brew weight",
     "Pre-infusion",
     "Auto-standby",
+    "Schedule",
+    "Timezone",
     "Pre-stop offset",
     "Steam",
     "WiFi",
@@ -68,7 +74,7 @@ static lv_obj_t *scr_settings;
 static lv_obj_t *scr_wifi;
 static lv_obj_t *scr_wifi_ap;
 
-enum UiScreen { UI_MAIN, UI_TIMER, UI_SETTINGS, UI_WIFI, UI_WIFI_AP };
+enum UiScreen { UI_MAIN, UI_TIMER, UI_SETTINGS, UI_WIFI, UI_WIFI_AP, UI_SCHED };
 static UiScreen cur_screen = UI_MAIN;
 
 // ─── Brew + shot tracking ──────────────────────────────────────────────────────
@@ -113,6 +119,8 @@ static lv_obj_t *lbl_shots;
 static lv_obj_t *lbl_scale_weight;
 static lv_obj_t *led_status;   // connectivity dot: green = WiFi + MQTT up
 static lv_obj_t *lbl_hint;
+static lv_obj_t *obj_sleep_overlay;   // scheduled-standby cover: tap to wake
+static lv_obj_t *lbl_sleep_sub;
 static lv_obj_t *lbl_target_val;
 static lv_obj_t *lbl_settemp_val;
 static lv_obj_t *obj_clean;
@@ -443,6 +451,33 @@ static void ui_main_create() {
     lv_obj_align(lbl_menu, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(lbl_menu, LV_OBJ_FLAG_CLICKABLE);
 
+    // Sleeping cover: shown while machine.standby is set (schedule or HA).
+    // Created last so it sits above every other main-screen widget.
+    obj_sleep_overlay = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_sleep_overlay, 480, 320);
+    lv_obj_set_pos(obj_sleep_overlay, 0, 0);
+    lv_obj_set_style_bg_color(obj_sleep_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(obj_sleep_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(obj_sleep_overlay, 0, 0);
+    lv_obj_set_style_radius(obj_sleep_overlay, 0, 0);
+    lv_obj_clear_flag(obj_sleep_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(obj_sleep_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(obj_sleep_overlay, sleep_wake_cb, LV_EVENT_CLICKED, NULL);
+    {
+        lv_obj_t *t = lv_label_create(obj_sleep_overlay);
+        lv_label_set_text(t, "SLEEPING");
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_32, 0);
+        lv_obj_set_style_text_color(t, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+        lv_obj_align(t, LV_ALIGN_CENTER, 0, -36);
+        lv_obj_clear_flag(t, LV_OBJ_FLAG_CLICKABLE);
+    }
+    lbl_sleep_sub = lv_label_create(obj_sleep_overlay);
+    lv_label_set_text(lbl_sleep_sub, "tap anywhere to wake");
+    lv_obj_set_style_text_font(lbl_sleep_sub, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_sleep_sub, lv_color_make(0x80, 0x80, 0x80), 0);
+    lv_obj_align(lbl_sleep_sub, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_clear_flag(lbl_sleep_sub, LV_OBJ_FLAG_CLICKABLE);
+
     lv_obj_clear_flag(obj_steam,        LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_steam,        LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(obj_heat,         LV_OBJ_FLAG_CLICKABLE);
@@ -520,6 +555,21 @@ static void ui_main_update() {
 
     // FW version, always visible next to the dot.
     lv_label_set_text(lbl_hint, FW_VERSION);
+
+    // Scheduled/commanded standby: cover the screen with the sleeping overlay.
+    if (machine.standby) {
+        if (settings.sched_enabled) {
+            char sb[48];
+            snprintf(sb, sizeof(sb), "wakes at %02u:%02u  -  tap anywhere to wake",
+                     settings.sched_wake_min / 60, settings.sched_wake_min % 60);
+            lv_label_set_text(lbl_sleep_sub, sb);
+        } else {
+            lv_label_set_text(lbl_sleep_sub, "tap anywhere to wake");
+        }
+        lv_obj_clear_flag(obj_sleep_overlay, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(obj_sleep_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // ─── TIMER SCREEN ─────────────────────────────────────────────────────────────
@@ -688,6 +738,17 @@ static const char* get_item_val(int i) {
             if (settings.standby_min == 0) snprintf(buf, sizeof(buf), "OFF");
             else snprintf(buf, sizeof(buf), "%d min", settings.standby_min);
             break;
+        case SI_SCHEDULE:
+            if (!settings.sched_enabled) snprintf(buf, sizeof(buf), "OFF");
+            else snprintf(buf, sizeof(buf), "%02u:%02u - %02u:%02u",
+                          settings.sched_wake_min / 60, settings.sched_wake_min % 60,
+                          settings.sched_sleep_min / 60, settings.sched_sleep_min % 60);
+            break;
+        case SI_TIMEZONE: {
+            int m = settings.tz_offset_min;
+            snprintf(buf, sizeof(buf), "UTC%+03d:%02d", m / 60, abs(m) % 60);
+            break;
+        }
         case SI_WIFI:
             snprintf(buf, sizeof(buf), "%.18s", wifi_config_ssid()); break;
         case SI_BREW_WEIGHT:
@@ -717,7 +778,7 @@ static void settings_draw() {
             sel ? lv_color_white() : lv_color_make(0x90, 0x90, 0x90), 0);
 
         char vbuf[32];
-        bool is_value_item = (i != SI_WIFI && i != SI_BACK);
+        bool is_value_item = (i != SI_WIFI && i != SI_BACK && i != SI_SCHEDULE);
         if (ed && is_value_item) {
             snprintf(vbuf, sizeof(vbuf), "< %s >", get_item_val(i));
             lv_obj_set_style_text_color(settings_val_lbl[i], lv_color_make(0xF0, 0xA8, 0x30), 0);
@@ -809,6 +870,9 @@ static void settings_scroll() {
 
 static void settings_select() {
     switch (settings_sel) {
+        case SI_SCHEDULE:
+            ui_show_sched();
+            return;
         case SI_WIFI:
             ui_show_wifi();
             return;
@@ -848,7 +912,11 @@ static void settings_edit_increment() {
             settings.prestop_offset_g += 0.5f;
             if (settings.prestop_offset_g > 8.0f) settings.prestop_offset_g = 0.0f;
             break;
-        // SI_WIFI, SI_BACK: no increment
+        case SI_TIMEZONE:
+            settings.tz_offset_min += 30;
+            if (settings.tz_offset_min > 840) settings.tz_offset_min = -720;  // +14h..-12h
+            break;
+        // SI_SCHEDULE, SI_WIFI, SI_BACK: no increment (navigation items)
     }
     settings_draw();
 }
@@ -857,6 +925,8 @@ static void settings_edit_confirm() {
     settings_edit = false;
     settings_save();
     if (settings_sel == SI_STEAM) machine_set_steam(settings.steam_on);
+    if (settings_sel == SI_TIMEZONE)  // re-apply the SNTP offset immediately
+        configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
     settings_draw();
 }
 
@@ -1018,6 +1088,209 @@ static void ui_wifi_ap_create() {
     lv_obj_clear_flag(btn_lbl, LV_OBJ_FLAG_CLICKABLE);
 }
 
+// ─── STANDBY SCHEDULE SCREEN ──────────────────────────────────────────────────
+// Daily absolute-time sleep/wake (settings.sched_*), edited with the same
+// arrow idiom as the main screen. Times are minutes since local midnight.
+
+static lv_obj_t *scr_sched;
+static lv_obj_t *obj_sched_en, *lbl_sched_en;
+static lv_obj_t *lbl_sched_wake, *lbl_sched_sleep;
+static lv_obj_t *lbl_sched_next, *lbl_sched_next_cap, *lbl_sched_clock;
+
+static void sched_wrap(uint16_t *v, int delta) {
+    int n = (int)*v + delta;
+    while (n < 0)     n += 1440;
+    while (n >= 1440) n -= 1440;
+    *v = (uint16_t)n;
+}
+static void sched_wake_h_up_cb(lv_event_t *e)   { sched_wrap(&settings.sched_wake_min,   60); }
+static void sched_wake_h_dn_cb(lv_event_t *e)   { sched_wrap(&settings.sched_wake_min,  -60); }
+static void sched_wake_m_up_cb(lv_event_t *e)   { sched_wrap(&settings.sched_wake_min,   15); }
+static void sched_wake_m_dn_cb(lv_event_t *e)   { sched_wrap(&settings.sched_wake_min,  -15); }
+static void sched_sleep_h_up_cb(lv_event_t *e)  { sched_wrap(&settings.sched_sleep_min,  60); }
+static void sched_sleep_h_dn_cb(lv_event_t *e)  { sched_wrap(&settings.sched_sleep_min, -60); }
+static void sched_sleep_m_up_cb(lv_event_t *e)  { sched_wrap(&settings.sched_sleep_min,  15); }
+static void sched_sleep_m_dn_cb(lv_event_t *e)  { sched_wrap(&settings.sched_sleep_min, -15); }
+static void sched_en_cb(lv_event_t *e)          { settings.sched_enabled = !settings.sched_enabled; }
+static void sched_back_cb(lv_event_t *e) {
+    settings_save();
+    ui_show_settings();
+}
+
+static lv_obj_t* sched_arrow(const char *sym, lv_event_cb_t cb, int x, int y) {
+    lv_obj_t *btn = lv_obj_create(scr_sched);
+    lv_obj_set_size(btn, 64, 44);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_style_bg_color(btn, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 6, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, sym);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_make(0xD4, 0x89, 0x1A), 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+    return btn;
+}
+
+static void ui_sched_create() {
+    scr_sched = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_sched, lv_color_black(), 0);
+    lv_obj_clear_flag(scr_sched, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(scr_sched, 0, 0);
+
+    lv_obj_t *hdr = lv_label_create(scr_sched);
+    lv_label_set_text(hdr, "STANDBY SCHEDULE");
+    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 10);
+
+    // ENABLED toggle pill, top-right.
+    obj_sched_en = lv_obj_create(scr_sched);
+    lv_obj_set_size(obj_sched_en, 116, 34);
+    lv_obj_align(obj_sched_en, LV_ALIGN_TOP_RIGHT, -10, 6);
+    lv_obj_set_style_radius(obj_sched_en, 17, 0);
+    lv_obj_set_style_border_width(obj_sched_en, 0, 0);
+    lv_obj_set_style_pad_all(obj_sched_en, 0, 0);
+    lv_obj_clear_flag(obj_sched_en, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_sched_en, sched_en_cb, LV_EVENT_CLICKED, NULL);
+    lbl_sched_en = lv_label_create(obj_sched_en);
+    lv_obj_set_style_text_font(lbl_sched_en, &lv_font_montserrat_16, 0);
+    lv_obj_align(lbl_sched_en, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(lbl_sched_en, LV_OBJ_FLAG_CLICKABLE);
+
+    auto col_label = [&](const char *txt, int x) {
+        lv_obj_t *l = lv_label_create(scr_sched);
+        lv_label_set_text(l, txt);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(l, lv_color_make(0x80, 0x80, 0x80), 0);
+        lv_obj_set_width(l, 144);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(l, x, 58);
+    };
+    col_label("WAKE",  40);
+    col_label("SLEEP", 480 - 40 - 144);
+
+    // Wake column (left): hour arrows over minute arrows, time between.
+    sched_arrow(LV_SYMBOL_UP,   sched_wake_h_up_cb,   40, 84);
+    sched_arrow(LV_SYMBOL_UP,   sched_wake_m_up_cb,  120, 84);
+    lbl_sched_wake = lv_label_create(scr_sched);
+    lv_obj_set_style_text_font(lbl_sched_wake, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(lbl_sched_wake, lv_color_make(0xD4, 0x89, 0x1A), 0);
+    lv_obj_set_width(lbl_sched_wake, 144);
+    lv_obj_set_style_text_align(lbl_sched_wake, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(lbl_sched_wake, 40, 142);
+    sched_arrow(LV_SYMBOL_DOWN, sched_wake_h_dn_cb,   40, 204);
+    sched_arrow(LV_SYMBOL_DOWN, sched_wake_m_dn_cb,  120, 204);
+
+    // Sleep column (right).
+    sched_arrow(LV_SYMBOL_UP,   sched_sleep_h_up_cb, 480 - 40 - 144, 84);
+    sched_arrow(LV_SYMBOL_UP,   sched_sleep_m_up_cb, 480 - 40 - 64,  84);
+    lbl_sched_sleep = lv_label_create(scr_sched);
+    lv_obj_set_style_text_font(lbl_sched_sleep, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(lbl_sched_sleep, lv_color_make(0xD4, 0x89, 0x1A), 0);
+    lv_obj_set_width(lbl_sched_sleep, 144);
+    lv_obj_set_style_text_align(lbl_sched_sleep, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(lbl_sched_sleep, 480 - 40 - 144, 142);
+    sched_arrow(LV_SYMBOL_DOWN, sched_sleep_h_dn_cb, 480 - 40 - 144, 204);
+    sched_arrow(LV_SYMBOL_DOWN, sched_sleep_m_dn_cb, 480 - 40 - 64,  204);
+
+    // Hour/minute captions under each arrow pair.
+    auto cap = [&](const char *txt, int x) {
+        lv_obj_t *l = lv_label_create(scr_sched);
+        lv_label_set_text(l, txt);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(l, lv_color_make(0x60, 0x60, 0x60), 0);
+        lv_obj_set_width(l, 64);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(l, x, 252);
+    };
+    cap("hour", 40);            cap("min",  120);
+    cap("hour", 480 - 40 - 144); cap("min", 480 - 40 - 64);
+
+    // Centre: next-event countdown.
+    lbl_sched_next_cap = lv_label_create(scr_sched);
+    lv_label_set_text(lbl_sched_next_cap, "");
+    lv_obj_set_style_text_font(lbl_sched_next_cap, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_sched_next_cap, lv_color_make(0x80, 0x80, 0x80), 0);
+    lv_obj_align(lbl_sched_next_cap, LV_ALIGN_CENTER, 0, -28);
+    lbl_sched_next = lv_label_create(scr_sched);
+    lv_label_set_text(lbl_sched_next, "");
+    lv_obj_set_style_text_font(lbl_sched_next, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lbl_sched_next, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_align(lbl_sched_next, LV_ALIGN_CENTER, 0, 0);
+
+    // Footer: board clock + sync state (left), BACK (right).
+    lbl_sched_clock = lv_label_create(scr_sched);
+    lv_label_set_text(lbl_sched_clock, "");
+    lv_obj_set_style_text_font(lbl_sched_clock, &lv_font_montserrat_16, 0);
+    lv_obj_align(lbl_sched_clock, LV_ALIGN_BOTTOM_LEFT, 12, -12);
+
+    lv_obj_t *btn_back = lv_obj_create(scr_sched);
+    lv_obj_set_size(btn_back, 116, 34);
+    lv_obj_align(btn_back, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
+    lv_obj_set_style_radius(btn_back, 17, 0);
+    lv_obj_set_style_border_width(btn_back, 0, 0);
+    lv_obj_set_style_bg_color(btn_back, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_pad_all(btn_back, 0, 0);
+    lv_obj_clear_flag(btn_back, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn_back, sched_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(btn_back);
+    lv_label_set_text(bl, "BACK");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(bl, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_align(bl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(bl, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void ui_sched_update() {
+    char b[24];
+    snprintf(b, sizeof(b), "%02u:%02u",
+             settings.sched_wake_min / 60, settings.sched_wake_min % 60);
+    lv_label_set_text(lbl_sched_wake, b);
+    snprintf(b, sizeof(b), "%02u:%02u",
+             settings.sched_sleep_min / 60, settings.sched_sleep_min % 60);
+    lv_label_set_text(lbl_sched_sleep, b);
+
+    lv_label_set_text(lbl_sched_en, settings.sched_enabled ? "ENABLED" : "OFF");
+    lv_obj_set_style_bg_color(obj_sched_en,
+        settings.sched_enabled ? lv_color_make(0x2E, 0x5E, 0x35)
+                               : lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_text_color(lbl_sched_en,
+        settings.sched_enabled ? lv_color_white() : lv_color_make(0x70, 0x70, 0x70), 0);
+
+    struct tm ti;
+    bool clock_ok = getLocalTime(&ti, 0);
+    if (clock_ok) {
+        char cb[40];
+        snprintf(cb, sizeof(cb), "clock %02d:%02d (NTP)", ti.tm_hour, ti.tm_min);
+        lv_label_set_text(lbl_sched_clock, cb);
+        lv_obj_set_style_text_color(lbl_sched_clock, lv_color_make(0x5C, 0xB8, 0x5C), 0);
+
+        if (settings.sched_enabled) {
+            int mod = ti.tm_hour * 60 + ti.tm_min;
+            int to_wake  = ((int)settings.sched_wake_min  - mod + 1440) % 1440;
+            int to_sleep = ((int)settings.sched_sleep_min - mod + 1440) % 1440;
+            bool wake_first = to_wake < to_sleep;
+            int mins = wake_first ? to_wake : to_sleep;
+            lv_label_set_text(lbl_sched_next_cap, wake_first ? "wakes in" : "sleeps in");
+            snprintf(cb, sizeof(cb), "%d h %02d m", mins / 60, mins % 60);
+            lv_label_set_text(lbl_sched_next, cb);
+        } else {
+            lv_label_set_text(lbl_sched_next_cap, "");
+            lv_label_set_text(lbl_sched_next, "schedule off");
+        }
+    } else {
+        lv_label_set_text(lbl_sched_clock, "waiting for clock (NTP)");
+        lv_obj_set_style_text_color(lbl_sched_clock, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_label_set_text(lbl_sched_next_cap, "");
+        lv_label_set_text(lbl_sched_next, clock_ok ? "" : "no time sync yet");
+    }
+}
+
 // ─── Screen switchers ──────────────────────────────────────────────────────────
 
 static void ui_show_main() {
@@ -1055,10 +1328,21 @@ static void ui_show_wifi_ap() {
     lv_scr_load(scr_wifi_ap);
 }
 
+static void ui_show_sched() {
+    ui_sched_update();
+    cur_screen = UI_SCHED;
+    lv_scr_load(scr_sched);
+}
+
 // ─── Touch callbacks ───────────────────────────────────────────────────────────
 
 static void menu_long_press_cb(lv_event_t *e) {
     if (cur_screen == UI_MAIN) ui_show_settings();
+}
+
+static void sleep_wake_cb(lv_event_t *e) {
+    machine_set_standby(false);   // manual override — holds until the next edge
+    wlogf("[sched] manual wake (overlay tap)\n");
 }
 
 static void timer_click_cb(lv_event_t *e) {
@@ -1077,6 +1361,10 @@ static void settings_row_click_cb(lv_event_t *e) {
 
     if (idx == SI_WIFI) {
         ui_show_wifi();
+        return;
+    }
+    if (idx == SI_SCHEDULE) {
+        ui_show_sched();
         return;
     }
     if (idx == SI_BACK) {
@@ -1101,6 +1389,7 @@ void ui_init() {
     ui_settings_create();
     ui_wifi_create();
     ui_wifi_ap_create();
+    ui_sched_create();
     lv_scr_load(scr_main);
 }
 
@@ -1143,6 +1432,42 @@ void ui_tick() {
         lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
         wlogf("[ui] clean cycle armed (2s hold)\n");
+    }
+
+    // ── Standby schedule: fire once at each sleep/wake edge ─────────────────────
+    // Edge-triggered on the minute so a manual wake (or HA command) between the
+    // edges is never fought. Sleep is skipped while a brew or cleaning cycle is
+    // running and retried each minute for up to 15 min after the edge.
+    {
+        static int s_last_mod = -1;
+        struct tm ti;
+        if (settings.sched_enabled && getLocalTime(&ti, 0)) {
+            int mod = ti.tm_hour * 60 + ti.tm_min;
+            if (mod != s_last_mod) {
+                bool booted_mid_run = (s_last_mod == -1);
+                s_last_mod = mod;
+                if (!booted_mid_run) {
+                    int past_sleep = (mod - (int)settings.sched_sleep_min + 1440) % 1440;
+                    if (past_sleep < 15 && !machine.standby &&
+                        !get_brew_active() && !machine_clean_active()) {
+                        // fire only right at the edge; the <15 window is the
+                        // busy-retry, and a manual wake inside it is respected
+                        // because machine.standby was true at the edge itself
+                        static uint32_t s_sleep_fired_day = 0;
+                        uint32_t day_key = (uint32_t)(ti.tm_yday + 1);
+                        if (s_sleep_fired_day != day_key) {
+                            s_sleep_fired_day = day_key;
+                            machine_set_standby(true);
+                            wlogf("[sched] sleep %02d:%02d\n", ti.tm_hour, ti.tm_min);
+                        }
+                    }
+                    if (mod == (int)settings.sched_wake_min && machine.standby) {
+                        machine_set_standby(false);
+                        wlogf("[sched] wake %02d:%02d\n", ti.tm_hour, ti.tm_min);
+                    }
+                }
+            }
+        }
     }
 
     // ── Cleaning-cycle overlay state machine ────────────────────────────────────
@@ -1285,6 +1610,7 @@ void ui_tick() {
             case UI_MAIN:     ui_main_update();  break;
             case UI_TIMER:    ui_timer_update(); break;
             case UI_WIFI:     ui_wifi_update();  break;
+            case UI_SCHED:    ui_sched_update(); break;
             case UI_SETTINGS:
             case UI_WIFI_AP:  break;
         }

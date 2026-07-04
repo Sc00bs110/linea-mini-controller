@@ -122,7 +122,8 @@ static void wifi_ota_init() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("WiFi OK — IP: %s\n", WiFi.localIP().toString().c_str());
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // UTC; no DST
+        // Local time = UTC + settings offset (settings-menu "Timezone" item).
+        configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
     } else {
         Serial.println("WiFi slow — retrying every 20s via wifi_tick()");
     }
