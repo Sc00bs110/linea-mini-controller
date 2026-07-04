@@ -196,9 +196,12 @@ static int _build_write(char* out, int cap,
 //   payload[27]      boiler flags bitmask
 //   payload[28..29]  coffee temp, uint16 BE / 10.0 °C
 static void _parse_r_frame(const char* buf, int len) {
-    // Config-block frame (0x0000/0x0020, 75 chars): only the setpoint is of
-    // interest. Requested periodically by machine_update() via gicar_read_req()
-    // so the machine's REAL setpoint register stays visible after boot.
+    // Config-block frame (0x0000/0x0020, 75 chars). payload[7..8] is the
+    // machine's EFFECTIVE setpoint (uint16 BE / 10). Verified live 2026-07-04:
+    // it ramps during warm-up (85.0 → 91.0 → 93.0 as the boiler heated) — a
+    // GICAR soft-start — then parks at the true target (93.0) while the boiler
+    // idles above it (94-95). The full 32-byte payload is dumped each read for
+    // ongoing overheat diagnosis (boiler hit 100-101 on 2026-07-04 morning).
     if (len == R_CFG_FRAME_LEN && buf[0] == 'R') {
         uint8_t want = _cs(buf, len - 2);
         uint8_t got  = _hex2(buf[len - 2], buf[len - 1]);
@@ -206,6 +209,7 @@ static void _parse_r_frame(const char* buf, int len) {
             wlogf("[gicar] cfg-frame checksum %02X!=%02X\n", got, want);
             return;
         }
+        wlogf("[gicar] cfg-block %.64s\n", buf + 9);
         uint8_t hi = _hex2(buf[9 + 7 * 2], buf[9 + 7 * 2 + 1]);
         uint8_t lo = _hex2(buf[9 + 8 * 2], buf[9 + 8 * 2 + 1]);
         float sp = (float)(((uint16_t)hi << 8) | lo) / 10.0f;

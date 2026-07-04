@@ -23,7 +23,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.18"
+#define FW_VERSION "v0.20"
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -33,26 +33,25 @@ static void ui_show_wifi();
 static void ui_show_wifi_ap();
 static void settings_draw();
 static void settings_edit_increment();
-static void main_click_cb(lv_event_t *e);
+static void menu_long_press_cb(lv_event_t *e);
 static void timer_click_cb(lv_event_t *e);
 static void settings_row_click_cb(lv_event_t *e);
 
 // ─── Settings items ────────────────────────────────────────────────────────────
 enum SettingsItem {
-    SI_TEMP,         // 0  88.0–96.0°C, step 0.5
-    SI_BREW_WEIGHT,  // 1  20–60 g, step 1 g
-    SI_PREINFUSION,  // 2  OFF / 0.5–10.0 s, step 0.5
-    SI_STANDBY,      // 3  OFF / 15 / 30 / 60 min
-    SI_PRESTOP,      // 4  0.0–8.0 g, step 0.5 g
-    SI_STEAM,        // 5  ON / OFF
-    SI_WIFI,         // 6  navigate → WiFi status screen
-    SI_BACK,         // 7  action — save + return to main
-    SI_COUNT         // 8
+    SI_BREW_WEIGHT,  // 0  20–60 g, step 1 g
+    SI_PREINFUSION,  // 1  OFF / 0.5–10.0 s, step 0.5
+    SI_STANDBY,      // 2  OFF / 15 / 30 / 60 min
+    SI_PRESTOP,      // 3  0.0–8.0 g, step 0.5 g
+    SI_STEAM,        // 4  ON / OFF
+    SI_WIFI,         // 5  navigate → WiFi status screen
+    SI_BACK,         // 6  action — save + return to main
+    SI_COUNT         // 7
 };
-// Clean cycle moved to a hold-to-start button on the Main screen (v0.16).
+// Clean cycle moved to a hold-to-start button on the Main screen (v0.16);
+// coffee temp moved to the main-screen edge adjuster (v0.20).
 
 static const char *item_names[SI_COUNT] = {
-    "Coffee temp",
     "Brew weight",
     "Pre-infusion",
     "Auto-standby",
@@ -107,6 +106,8 @@ static void demo_update() {
 static lv_obj_t *lbl_temp;
 static lv_obj_t *obj_steam;
 static lv_obj_t *lbl_steam;
+static lv_obj_t *obj_heat;    // top-left pill, lit while the boiler element is on
+static lv_obj_t *lbl_heat;
 static lv_obj_t *lbl_brew;
 static lv_obj_t *lbl_shots;
 static lv_obj_t *lbl_scale_weight;
@@ -251,6 +252,22 @@ static void ui_main_create() {
     lv_obj_set_style_text_font(lbl_steam, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_steam, lv_color_make(0x70, 0x70, 0x70), 0);
     lv_obj_align(lbl_steam, LV_ALIGN_CENTER, 0, 0);
+
+    // HEAT: mirrors the STEAM pill on the left edge; lit while the machine
+    // reports the boiler heating element active (boiler_flags bit 0).
+    obj_heat = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_heat, 120, 32);
+    lv_obj_align(obj_heat, LV_ALIGN_TOP_LEFT, 8, 8);
+    lv_obj_set_style_radius(obj_heat, 16, 0);
+    lv_obj_set_style_border_width(obj_heat, 0, 0);
+    lv_obj_set_style_bg_color(obj_heat, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_pad_all(obj_heat, 0, 0);
+    lv_obj_clear_flag(obj_heat, LV_OBJ_FLAG_SCROLLABLE);
+    lbl_heat = lv_label_create(obj_heat);
+    lv_label_set_text(lbl_heat, "HEAT");
+    lv_obj_set_style_text_font(lbl_heat, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_heat, lv_color_make(0x70, 0x70, 0x70), 0);
+    lv_obj_align(lbl_heat, LV_ALIGN_CENTER, 0, 0);
 
     lbl_brew = lv_label_create(scr_main);
     lv_label_set_text(lbl_brew, "BREWING");
@@ -408,17 +425,34 @@ static void ui_main_create() {
     lv_obj_align(lbl_hint, LV_ALIGN_BOTTOM_LEFT, 32, -6);   // right of the status dot
 
 
+    // MENU: bottom-centre box; LONG press opens the settings screen (a plain
+    // tap does nothing — replaces the old tap-anywhere-on-screen behaviour).
+    lv_obj_t *obj_menu = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_menu, 120, 36);
+    lv_obj_align(obj_menu, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_radius(obj_menu, 18, 0);
+    lv_obj_set_style_border_width(obj_menu, 0, 0);
+    lv_obj_set_style_bg_color(obj_menu, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_pad_all(obj_menu, 0, 0);
+    lv_obj_clear_flag(obj_menu, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_menu, menu_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_t *lbl_menu = lv_label_create(obj_menu);
+    lv_label_set_text(lbl_menu, "MENU");
+    lv_obj_set_style_text_font(lbl_menu, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_menu, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_align(lbl_menu, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(lbl_menu, LV_OBJ_FLAG_CLICKABLE);
+
     lv_obj_clear_flag(obj_steam,        LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_steam,        LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(obj_heat,         LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(lbl_heat,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_temp,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_brew,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_shots,        LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_scale_weight, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(led_status,       LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_hint,         LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_add_flag(scr_main, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scr_main, main_click_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void ui_main_update() {
@@ -437,6 +471,12 @@ static void ui_main_update() {
         steam ? lv_color_make(0xFF, 0x70, 0x43) : lv_color_make(0x28, 0x28, 0x28), 0);
     lv_obj_set_style_text_color(lbl_steam,
         steam ? lv_color_white() : lv_color_make(0x70, 0x70, 0x70), 0);
+
+    bool heat = machine.connected && machine.heating_element;
+    lv_obj_set_style_bg_color(obj_heat,
+        heat ? lv_color_make(0xE5, 0x39, 0x35) : lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_text_color(lbl_heat,
+        heat ? lv_color_white() : lv_color_make(0x70, 0x70, 0x70), 0);
 
     if (get_brew_active())
         lv_obj_clear_flag(lbl_brew, LV_OBJ_FLAG_HIDDEN);
@@ -638,8 +678,6 @@ static bool      settings_edit = false;
 static const char* get_item_val(int i) {
     static char buf[28];
     switch (i) {
-        case SI_TEMP:
-            snprintf(buf, sizeof(buf), "%.1f\xc2\xb0" "C", settings.coffee_temp_c); break;
         case SI_PREINFUSION:
             if (settings.preinfusion_s < 0.05f) snprintf(buf, sizeof(buf), "OFF");
             else snprintf(buf, sizeof(buf), "%.1f s", settings.preinfusion_s);
@@ -789,10 +827,6 @@ static void settings_select() {
 
 static void settings_edit_increment() {
     switch (settings_sel) {
-        case SI_TEMP:
-            settings.coffee_temp_c += 0.5f;
-            if (settings.coffee_temp_c > 96.0f) settings.coffee_temp_c = 88.0f;
-            break;
         case SI_PREINFUSION:
             settings.preinfusion_s += 0.5f;
             if (settings.preinfusion_s > 10.0f) settings.preinfusion_s = 0.0f;
@@ -822,7 +856,6 @@ static void settings_edit_increment() {
 static void settings_edit_confirm() {
     settings_edit = false;
     settings_save();
-    if (settings_sel == SI_TEMP)  machine_set_temp(settings.coffee_temp_c);
     if (settings_sel == SI_STEAM) machine_set_steam(settings.steam_on);
     settings_draw();
 }
@@ -1024,7 +1057,7 @@ static void ui_show_wifi_ap() {
 
 // ─── Touch callbacks ───────────────────────────────────────────────────────────
 
-static void main_click_cb(lv_event_t *e) {
+static void menu_long_press_cb(lv_event_t *e) {
     if (cur_screen == UI_MAIN) ui_show_settings();
 }
 
