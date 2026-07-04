@@ -23,7 +23,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.21"
+#define FW_VERSION "v0.22"
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -715,7 +715,8 @@ static void ui_timer_update() {
 // ─── SETTINGS SCREEN ──────────────────────────────────────────────────────────
 
 #define SETTINGS_HDR_H  36
-#define SETTINGS_ITEM_H 36
+#define SETTINGS_ITEM_H 56          // 24px font + touch-friendly row height
+#define SETTINGS_LIST_W 400         // rows; the right column holds nav buttons
 
 static lv_obj_t *lbl_settings_hdr;
 static lv_obj_t *settings_scroll_cont;
@@ -762,6 +763,10 @@ static const char* get_item_val(int i) {
     }
     return buf;
 }
+
+static void settings_nav_up_cb(lv_event_t *e);
+static void settings_nav_dn_cb(lv_event_t *e);
+static void settings_nav_ret_cb(lv_event_t *e);
 
 static void settings_draw() {
     for (int i = 0; i < SI_COUNT; i++) {
@@ -813,7 +818,7 @@ static void ui_settings_create() {
     lv_obj_align(lbl_settings_hdr, LV_ALIGN_LEFT_MID, 8, 0);
 
     lv_obj_t *lbl_hdr_hint = lv_label_create(hdr);
-    lv_label_set_text(lbl_hdr_hint, "btn:short=next  long=select  tap=cycle");
+    lv_label_set_text(lbl_hdr_hint, "tap row to change  |  arrows to navigate");
     lv_obj_set_style_text_font(lbl_hdr_hint, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(lbl_hdr_hint, lv_color_make(0x60, 0x60, 0x60), 0);
     lv_obj_align(lbl_hdr_hint, LV_ALIGN_RIGHT_MID, -8, 0);
@@ -823,7 +828,7 @@ static void ui_settings_create() {
     lv_obj_clear_flag(lbl_hdr_hint, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *scroll = lv_obj_create(scr_settings);
-    lv_obj_set_size(scroll, 480, 320 - SETTINGS_HDR_H);
+    lv_obj_set_size(scroll, SETTINGS_LIST_W, 320 - SETTINGS_HDR_H);
     lv_obj_set_pos(scroll, 0, SETTINGS_HDR_H);
     lv_obj_set_style_bg_color(scroll, lv_color_black(), 0);
     lv_obj_set_style_border_width(scroll, 0, 0);
@@ -837,7 +842,7 @@ static void ui_settings_create() {
 
     for (int i = 0; i < SI_COUNT; i++) {
         lv_obj_t *row = lv_obj_create(scroll);
-        lv_obj_set_size(row, 480, SETTINGS_ITEM_H);
+        lv_obj_set_size(row, SETTINGS_LIST_W, SETTINGS_ITEM_H);
         lv_obj_set_pos(row, 0, i * SETTINGS_ITEM_H);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -846,18 +851,41 @@ static void ui_settings_create() {
         settings_rows[i] = row;
 
         settings_name_lbl[i] = lv_label_create(row);
-        lv_obj_set_style_text_font(settings_name_lbl[i], &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(settings_name_lbl[i], &lv_font_montserrat_24, 0);
         lv_obj_align(settings_name_lbl[i], LV_ALIGN_LEFT_MID, 4, 0);
         lv_obj_clear_flag(settings_name_lbl[i], LV_OBJ_FLAG_CLICKABLE);
 
         settings_val_lbl[i] = lv_label_create(row);
-        lv_obj_set_style_text_font(settings_val_lbl[i], &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(settings_val_lbl[i], &lv_font_montserrat_24, 0);
         lv_obj_align(settings_val_lbl[i], LV_ALIGN_RIGHT_MID, -8, 0);
         lv_obj_clear_flag(settings_val_lbl[i], LV_OBJ_FLAG_CLICKABLE);
 
         lv_obj_add_event_cb(row, settings_row_click_cb, LV_EVENT_CLICKED,
                             (void*)(intptr_t)i);
     }
+
+    // Right-hand nav column: move the highlight without precise row taps,
+    // return (↵) activates the highlighted item.
+    auto nav_btn = [&](const char *sym, lv_event_cb_t cb, int y, int h) {
+        lv_obj_t *btn = lv_obj_create(scr_settings);
+        lv_obj_set_size(btn, 68, h);
+        lv_obj_set_pos(btn, 406, y);
+        lv_obj_set_style_bg_color(btn, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_radius(btn, 8, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *l = lv_label_create(btn);
+        lv_label_set_text(l, sym);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(l, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_obj_align(l, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE);
+    };
+    nav_btn(LV_SYMBOL_UP,       settings_nav_up_cb,  SETTINGS_HDR_H + 6,   84);
+    nav_btn(LV_SYMBOL_DOWN,     settings_nav_dn_cb,  SETTINGS_HDR_H + 98,  84);
+    nav_btn(LV_SYMBOL_NEW_LINE, settings_nav_ret_cb, SETTINGS_HDR_H + 190, 84);
 
     settings_draw();
 }
@@ -928,6 +956,42 @@ static void settings_edit_confirm() {
     if (settings_sel == SI_TIMEZONE)  // re-apply the SNTP offset immediately
         configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
     settings_draw();
+}
+
+// Side-effects a changed item must push beyond NVS (used by tap-cycle and the
+// ↵ nav button; the physical-button flow reaches these via settings_edit_confirm).
+static void settings_apply_item(int idx) {
+    if (idx == SI_STEAM) machine_set_steam(settings.steam_on);
+    if (idx == SI_TIMEZONE)
+        configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+static void settings_nav_up_cb(lv_event_t *e) {
+    settings_sel = (settings_sel + SI_COUNT - 1) % SI_COUNT;
+    settings_edit = false;
+    settings_draw();
+    lv_obj_scroll_to_view(settings_rows[settings_sel], LV_ANIM_OFF);
+}
+
+static void settings_nav_dn_cb(lv_event_t *e) {
+    settings_scroll();   // existing: sel+1, redraw, scroll into view
+}
+
+static void settings_nav_ret_cb(lv_event_t *e) {
+    switch (settings_sel) {
+        case SI_WIFI:     ui_show_wifi();  return;
+        case SI_SCHEDULE: ui_show_sched(); return;
+        case SI_BACK:
+            settings_save();
+            settings_sel  = 0;
+            settings_edit = false;
+            ui_show_main();
+            return;
+        default:  // value item: cycle one step, same as tapping the row
+            settings_edit_increment();
+            settings_apply_item(settings_sel);
+            return;
+    }
 }
 
 // ─── WIFI STATUS SCREEN ───────────────────────────────────────────────────────
@@ -1378,6 +1442,7 @@ static void settings_row_click_cb(lv_event_t *e) {
     settings_sel  = idx;
     settings_edit = false;
     settings_edit_increment();
+    settings_apply_item(idx);   // steam/timezone take effect immediately
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────────
