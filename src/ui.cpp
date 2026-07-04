@@ -23,7 +23,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.16"
+#define FW_VERSION "v0.17"
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -110,7 +110,7 @@ static lv_obj_t *lbl_steam;
 static lv_obj_t *lbl_brew;
 static lv_obj_t *lbl_shots;
 static lv_obj_t *lbl_scale_weight;
-static lv_obj_t *lbl_status;
+static lv_obj_t *led_status;   // connectivity dot: green = WiFi + MQTT up
 static lv_obj_t *lbl_hint;
 static lv_obj_t *lbl_target_val;
 static lv_obj_t *lbl_settemp_val;
@@ -271,11 +271,14 @@ static void ui_main_create() {
     lv_obj_set_style_text_color(lbl_scale_weight, lv_color_make(0x3A, 0x80, 0x3A), 0);
     lv_obj_align(lbl_scale_weight, LV_ALIGN_CENTER, 0, 82);
 
-    lbl_status = lv_label_create(scr_main);
-    lv_label_set_text(lbl_status, "WiFi: connecting...");
-    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_status, lv_color_make(0x80, 0x80, 0x80), 0);
-    lv_obj_align(lbl_status, LV_ALIGN_BOTTOM_LEFT, 8, -22);
+    led_status = lv_obj_create(scr_main);
+    lv_obj_set_size(led_status, 16, 16);
+    lv_obj_set_style_radius(led_status, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(led_status, lv_color_make(0x35, 0x35, 0x35), 0);
+    lv_obj_set_style_border_width(led_status, 0, 0);
+    lv_obj_set_style_pad_all(led_status, 0, 0);
+    lv_obj_clear_flag(led_status, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(led_status, LV_ALIGN_BOTTOM_LEFT, 8, -8);
 
     // Edge adjusters: ▲ / value / ▼ columns flush against each screen border,
     // vertically centred. Left = coffee setpoint (0.5° steps), right = brew
@@ -402,7 +405,7 @@ static void ui_main_create() {
     lv_label_set_text(lbl_hint, "Gicar: waiting...");
     lv_obj_set_style_text_font(lbl_hint, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_hint, lv_color_make(0x70, 0x70, 0x70), 0);
-    lv_obj_align(lbl_hint, LV_ALIGN_BOTTOM_LEFT, 8, -6);
+    lv_obj_align(lbl_hint, LV_ALIGN_BOTTOM_LEFT, 32, -6);   // right of the status dot
 
 
     lv_obj_clear_flag(obj_steam,        LV_OBJ_FLAG_CLICKABLE);
@@ -411,9 +414,8 @@ static void ui_main_create() {
     lv_obj_clear_flag(lbl_brew,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_shots,        LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_scale_weight, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(lbl_status,       LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(led_status,       LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_hint,         LV_OBJ_FLAG_CLICKABLE);
-    // lbl_hint is always visible (Gicar diagnostic line)
 
     lv_obj_add_flag(scr_main, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr_main, main_click_cb, LV_EVENT_CLICKED, NULL);
@@ -463,63 +465,15 @@ static void ui_main_update() {
         lv_label_set_text(lbl_scale_weight, "");
     }
 
-    // ── Status line 1: WiFi + MQTT ───────────────────────────────────────────────
-    static char stbuf[80];
+    // ── Connectivity dot: green when WiFi + MQTT are both up, dark otherwise ────
     bool wifi_ok = (WiFi.status() == WL_CONNECTED);
     bool mqtt_ok = mqtt_connected();
+    lv_obj_set_style_bg_color(led_status,
+        (wifi_ok && mqtt_ok) ? lv_color_make(0x2E, 0xC8, 0x4B)
+                             : lv_color_make(0x35, 0x35, 0x35), 0);
 
-    if (wifi_ok) {
-        const char* mqtt_str = mqtt_ok ? "MQTT:OK" : "MQTT:--";
-        if (machine.connected) {
-            snprintf(stbuf, sizeof(stbuf), "%s  %s  |  Machine OK",
-                     WiFi.localIP().toString().c_str(), mqtt_str);
-            lv_obj_set_style_text_color(lbl_status, lv_color_make(0x5C, 0xB8, 0x5C), 0);
-        } else {
-            snprintf(stbuf, sizeof(stbuf), "%s  %s  RSSI:%d",
-                     WiFi.localIP().toString().c_str(), mqtt_str, WiFi.RSSI());
-            lv_obj_set_style_text_color(lbl_status, lv_color_make(0xD4, 0x89, 0x1A), 0);
-        }
-    } else if (WiFi.getMode() == WIFI_OFF) {
-        snprintf(stbuf, sizeof(stbuf), "WiFi: off  |  Scale: %s",
-                 scale_connected() ? "connected" : "scanning...");
-        lv_obj_set_style_text_color(lbl_status, lv_color_make(0x80, 0x80, 0x80), 0);
-    } else {
-        uint32_t retries = wifi_retry_count();
-        if (retries == 0) {
-            snprintf(stbuf, sizeof(stbuf), "WiFi: connecting...");
-        } else {
-            snprintf(stbuf, sizeof(stbuf), "WiFi: retrying (%lu)  MQTT:--", retries);
-        }
-        lv_obj_set_style_text_color(lbl_status, lv_color_make(0xEF, 0x53, 0x50), 0);
-    }
-    lv_label_set_text(lbl_status, stbuf);
-
-    // ── Status line 2: Gicar diagnostic + FW version (colour-coded) ────────────
-    static char gbuf[64];
-    uint32_t rx    = gicar_rx_total();
-    uint32_t frms  = gicar_frame_count();
-    const char* hs = gicar_handshake_ok() ? "H:OK" : "H:--";
-    snprintf(gbuf, sizeof(gbuf), FW_VERSION "  %s  rx:%lu  fr:%lu", hs, rx, frms);
-    lv_label_set_text(lbl_hint, gbuf);
-
-    if (frms > 0) {
-        lv_obj_set_style_text_color(lbl_hint, lv_color_make(0x5C, 0xB8, 0x5C), 0);  // green — frames OK
-    } else if (rx > 0) {
-        lv_obj_set_style_text_color(lbl_hint, lv_color_make(0xD4, 0x89, 0x1A), 0);  // amber — bytes but no frames
-    } else {
-        lv_obj_set_style_text_color(lbl_hint, lv_color_make(0xB0, 0x55, 0x55), 0);  // dark red — no data at all
-    }
-
-    // Both diagnostic lines only appear when something is actually wrong
-    // (WiFi enabled but down, MQTT down, machine link down, or no frames).
-    bool healthy = wifi_ok && mqtt_ok && machine.connected && frms > 0;
-    if (healthy) {
-        lv_obj_add_flag(lbl_status, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(lbl_hint,   LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_clear_flag(lbl_status, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(lbl_hint,   LV_OBJ_FLAG_HIDDEN);
-    }
+    // FW version, always visible next to the dot.
+    lv_label_set_text(lbl_hint, FW_VERSION);
 }
 
 // ─── TIMER SCREEN ─────────────────────────────────────────────────────────────
@@ -1299,6 +1253,6 @@ void ui_tick() {
 }
 
 void ui_ota_start() {
-    lv_label_set_text(lbl_status, "OTA updating...");
+    lv_label_set_text(lbl_hint, "OTA updating...");
     lv_timer_handler();
 }

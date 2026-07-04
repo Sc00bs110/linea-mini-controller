@@ -1,0 +1,18 @@
+# LineaMini_C6 OTA partition table -- 4MB flash, two max-size OTA app slots.
+#
+# huge_app.csv (previous scheme) has a single 3MB factory slot and NO ota_0/ota_1
+# pair, so ArduinoOTA's Update.begin() failed silently: the board answered the
+# espota UDP invitation with "OK" but never connected back for the image
+# (diagnosed live 2026-07-04).
+#
+# Slots are 0x1F0000 (2,031,616 B) each -- 64KB more than min_spiffs.csv --
+# because the app image is already ~1.94MB. LittleFS shrinks to 64KB, which is
+# plenty for the shot log. Label stays "spiffs" (Arduino LittleFS mounts by that
+# label).
+#
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xe000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x1F0000
+app1,     app,  ota_1,   0x200000, 0x1F0000
+spiffs,   data, spiffs,  0x3F0000, 0x10000
