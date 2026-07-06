@@ -59,8 +59,15 @@
 // shares CPU time with loop() via the scheduler). Matches the reference
 // bring-up's ota_task() exactly -- see the OTA-on-core-1/WiFiUDP note below.
 
+// mDNS/OTA hostname. Per-env: the S3 env overrides via build_flags so both
+// boards can be on the network at once during the port (same name = mDNS fight
+// and OTA/wlog target the wrong board).
+#ifndef DEVICE_HOSTNAME
+#define DEVICE_HOSTNAME "linea-mini-c6"
+#endif
+
 static void ota_task(void*) {
-    ArduinoOTA.setHostname("linea-mini-c6");
+    ArduinoOTA.setHostname(DEVICE_HOSTNAME);
     if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
 
     ArduinoOTA.onStart([]() {
