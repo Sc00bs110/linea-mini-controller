@@ -16,8 +16,16 @@
 // opposite mapping -- that pointer was wrong; live frame parsing is the
 // ground truth here.)
 // invert=true: CN11 is idle-LOW inverted LVCMOS; pull-up level-shifts but does not invert
+//
+// The C6 build leaves these header defaults in place. On the ESP32-S3 (DFR0975),
+// GPIO1/2/3 are GDI connector pins, so the S3 env overrides GICAR_RX_PIN/
+// GICAR_TX_PIN via build_flags in platformio.ini -- hence the #ifndef guards.
+#ifndef GICAR_RX_PIN
 #define GICAR_RX_PIN    3   // CN11 TXD → ESP RX (10kΩ pull-up + series R)
+#endif
+#ifndef GICAR_TX_PIN
 #define GICAR_TX_PIN    2   // ESP TX → CN11 RXD (series R)
+#endif
 #define GICAR_BAUD      9600
 #define GICAR_BUF_SIZE  128
 

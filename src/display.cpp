@@ -9,10 +9,11 @@
 // as the 480x320 landscape the espresso UI expects, with X mirrored to correct
 // the DFR1092 GDI physical orientation.
 //
-// GDI-to-GPIO mapping (from platformio.ini build_flags, single source of truth):
-//   SCLK = TFT_SCLK (23)  MOSI = TFT_MOSI (22)  MISO = TFT_MISO (21)
-//   LCD_DC = TFT_DC (8)   LCD_RST = TFT_RST (14)  LCD_CS = TFT_CS (1)
-//   LCD_BL = TFT_BL (15, PWM backlight)
+// GDI-to-GPIO mapping (from platformio.ini build_flags, single source of truth;
+// the actual pin numbers are per-env -- C6 vs S3 differ, see platformio.ini):
+//   SCLK = TFT_SCLK   MOSI = TFT_MOSI   MISO = TFT_MISO
+//   LCD_DC = TFT_DC   LCD_RST = TFT_RST   LCD_CS = TFT_CS
+//   LCD_BL = TFT_BL (PWM backlight)
 // Panel geometry comes from TFT_WIDTH (320) / TFT_HEIGHT (480).
 
 #include <Arduino.h>
@@ -23,11 +24,12 @@
 
 // ── LovyanGFX device definition ─────────────────────────────────────────────
 // Configuration below is the empirically-confirmed-working combination for the
-// DFR1092 on this board: SPI2_HOST (the C6's only user SPI peripheral), mode 0,
-// a 20 MHz write clock (the ILI9488's practical maximum), and a PWM backlight on
-// GPIO15. Pins come from the TFT_* macros so pin assignments live only in
-// platformio.ini. Do not "tidy" the odd-looking Light_PWM values (freq 44100,
-// channel 7) -- this exact block is what lit the physical panel.
+// DFR1092 on this board: SPI2_HOST (a user SPI peripheral valid on both the C6
+// and the S3), mode 0, a 20 MHz write clock (the ILI9488's practical maximum),
+// and a PWM backlight on TFT_BL. Pins come from the TFT_* macros so pin
+// assignments live only in platformio.ini (per-env). Do not "tidy" the
+// odd-looking Light_PWM values (freq 44100, channel 7) -- this exact block is
+// what lit the physical panel.
 class LGFX : public lgfx::LGFX_Device {
     lgfx::Panel_ILI9488 _panel;
     lgfx::Bus_SPI       _bus;
@@ -37,21 +39,21 @@ public:
     LGFX() {
         {
             auto cfg = _bus.config();
-            cfg.spi_host   = SPI2_HOST;   // ESP32-C6: only user SPI peripheral
+            cfg.spi_host   = SPI2_HOST;   // user SPI peripheral (valid on C6 and S3)
             cfg.spi_mode   = 0;
             cfg.freq_write = 20000000;    // ILI9488 max SPI write is ~20MHz
             cfg.freq_read  = 16000000;
-            cfg.pin_sclk   = TFT_SCLK;    // 23
-            cfg.pin_mosi   = TFT_MOSI;    // 22
-            cfg.pin_miso   = TFT_MISO;    // 21
-            cfg.pin_dc     = TFT_DC;      // 8
+            cfg.pin_sclk   = TFT_SCLK;    // per-env, see platformio.ini
+            cfg.pin_mosi   = TFT_MOSI;    // per-env, see platformio.ini
+            cfg.pin_miso   = TFT_MISO;    // per-env, see platformio.ini
+            cfg.pin_dc     = TFT_DC;      // per-env, see platformio.ini
             _bus.config(cfg);
             _panel.setBus(&_bus);
         }
         {
             auto cfg = _panel.config();
-            cfg.pin_cs       = TFT_CS;    // 1
-            cfg.pin_rst      = TFT_RST;   // 14
+            cfg.pin_cs       = TFT_CS;    // per-env, see platformio.ini
+            cfg.pin_rst      = TFT_RST;   // per-env, see platformio.ini
             cfg.pin_busy     = -1;
             cfg.panel_width  = TFT_WIDTH;  // 320 (portrait native)
             cfg.panel_height = TFT_HEIGHT; // 480 (portrait native)
@@ -65,7 +67,7 @@ public:
         }
         {
             auto cfg = _light.config();
-            cfg.pin_bl      = TFT_BL;     // 15
+            cfg.pin_bl      = TFT_BL;     // per-env, see platformio.ini
             cfg.invert      = false;
             cfg.freq        = 44100;
             cfg.pwm_channel = 7;
@@ -92,8 +94,8 @@ static const uint32_t SCREEN_H = 320;
 // Single partial draw buffer covering 10 full rows (480 * 10 = 4800 px). This is
 // the exact buffer size used by the confirmed-working reference bring-up. LVGL
 // renders a dirty region into this buffer, then disp_flush() blits it to the
-// panel; a partial buffer keeps RAM low (no full-frame framebuffer -- the C6 has
-// no PSRAM).
+// panel; a partial buffer in internal RAM keeps memory low and avoids relying on
+// PSRAM (the C6 has none; the S3 does, but this path does not need it).
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t         lv_buf[SCREEN_W * 10];
 

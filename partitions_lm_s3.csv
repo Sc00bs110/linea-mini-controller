@@ -1,0 +1,19 @@
+# LineaMini_S3 OTA partition table -- 16MB flash (DFR0975 / ESP32-S3-WROOM-1-N16R8).
+#
+# Same OTA scheme as partitions_lm_ota.csv (the 4MB C6 table), scaled up for the
+# S3's 16MB flash: two large OTA app slots (ota_0/ota_1) so ArduinoOTA's
+# Update.begin() has a valid inactive slot to write into -- a single-slot layout
+# (e.g. huge_app.csv) makes espota accept the invitation then fail silently.
+#
+# Slots are 0x640000 (6,553,600 B = 6.25MB) each -- far larger than the current
+# ~1.9MB app, leaving generous OTA headroom. LittleFS gets 0x370000 (~3.4MB) for
+# the shot log. Label stays "spiffs" (Arduino LittleFS mounts by that label).
+#
+# Offsets sum to exactly 0x1000000 (16MB); both app slots are 0x10000-aligned.
+#
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xe000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x640000
+app1,     app,  ota_1,   0x650000, 0x640000
+spiffs,   data, spiffs,  0xC90000, 0x370000
