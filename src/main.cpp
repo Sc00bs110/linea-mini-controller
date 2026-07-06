@@ -170,11 +170,6 @@ void setup() {
     // ui_init(), which requires lv_disp_drv_register() to have completed.
     display_init();
 
-    // Register the GT911 touch pointer indev. LVGL indevs may register any time
-    // before the first lv_timer_handler(), so doing it right after display_init()
-    // (before the widget tree is built) is fine and keeps the ordering simple.
-    touch_init();
-
     // Load NVS credentials/settings before WiFi/UI need them.
     wifi_config_init();
     settings_init();
@@ -182,6 +177,10 @@ void setup() {
     // Build the UI widget tree on the registered LVGL display.
     ui_init();
     lv_timer_handler();   // first render before WiFi blocks (~10s connect timeout)
+
+    // Register the GT911 touch pointer indev. Must come after ui_init()/the
+    // first lv_timer_handler() -- see the comment on touch_init() in touch.cpp.
+    touch_init();
 
     // WiFi connects first -- BLE scanning starts only after WiFi is up, per the
     // reference bring-up's note about WiFi/BLE coexistence contention on this

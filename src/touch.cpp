@@ -207,6 +207,15 @@ static void touch_read_cb(lv_indev_drv_t* /*drv*/, lv_indev_data_t* data) {
     }
 }
 
+// Call from main.cpp AFTER ui_init()/the first lv_timer_handler(), not before.
+// On the ESP32-S3 (DFR0975 port), bringing Wire up earlier left the I2C
+// peripheral wedged (every subsequent transaction short-read, Wire.endTransmission
+// != 0) by the time loop() started polling -- something else in early setup()
+// (LVGL/display bring-up shares no pins with I2C, so the exact interaction is
+// unconfirmed) aborted the bus mid-transaction. Deferring touch_init() to run
+// after the display is already live sidesteps it entirely; verified against
+// real hardware 2026-07-06. The C6 build never showed this symptom, so this may
+// be S3-Arduino-core-specific.
 void touch_init() {
     // 400 kHz is well within GT911's rating and keeps the polled read cheap.
     Wire.begin(TOUCH_SDA, TOUCH_SCL);
