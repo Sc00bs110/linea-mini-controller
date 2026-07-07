@@ -200,6 +200,27 @@ void setup() {
     // in setup() too. ui.cpp already renders a sane placeholder ("--.-°C",
     // disconnected) before real data arrives, so this ordering costs nothing
     // functionally.
+#ifdef GICAR_WIRE_TEST
+    // Validate the new GICAR pin choice BEFORE any resoldering: blink both
+    // pins in antiphase (3s hi / 3s lo, ~90s) so a DMM on the bare header pads
+    // confirms which physical pin is which, independent of silk labels (see
+    // the GICAR pin comment in platformio.ini for why this project no longer
+    // trusts silk/wiki labels alone). Remove -DGICAR_WIRE_TEST once confirmed.
+    Serial.printf("[gicar] WIRE TEST: blinking GPIO%d/GPIO%d for ~90s (antiphase, 3s)\n",
+                  GICAR_RX_PIN, GICAR_TX_PIN);
+    pinMode(GICAR_RX_PIN, OUTPUT);
+    pinMode(GICAR_TX_PIN, OUTPUT);
+    for (int i = 0; i < 30; i++) {
+        digitalWrite(GICAR_RX_PIN, i & 1);
+        digitalWrite(GICAR_TX_PIN, !(i & 1));
+        delay(3000);
+        lv_timer_handler();
+    }
+    gpio_reset_pin((gpio_num_t)GICAR_RX_PIN);
+    gpio_reset_pin((gpio_num_t)GICAR_TX_PIN);
+    Serial.println("[gicar] WIRE TEST done");
+#endif
+
     machine_init();
     shot_log_init();
 }

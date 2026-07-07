@@ -464,6 +464,27 @@ void gicar_process() {
                   _rx_total, d, d / 5, _frame_count, _r_frame_count);
             s_rate_rx = _rx_total;
             s_rate_ms = millis();
+
+            // TEMP wiring diag: raw electrical sample of both GICAR pads.
+            // Healthy: RX idle-LOW with edge bursts after each 760 ms poll.
+            if (_r_frame_count < 5) {
+                for (int k = 0; k < 2; k++) {
+                    const int pin = k ? GICAR_TX_PIN : GICAR_RX_PIN;
+                    uint32_t hi = 0, n = 0, edges = 0;
+                    int prev = digitalRead(pin);
+                    const uint32_t t0 = micros();
+                    // 2 s window -- spans at least two 760 ms poll cycles, so
+                    // a real TX poll or RX reply cannot be missed by timing.
+                    while (micros() - t0 < 2000000) {
+                        const int v = digitalRead(pin);
+                        hi += (uint32_t)v; n++;
+                        if (v != prev) { edges++; prev = v; }
+                    }
+                    wlogf("[gicar] rawpin GPIO%d: %lu%% high, edges=%lu (n=%lu)\n",
+                          pin, (unsigned long)(n ? 100 * hi / n : 0),
+                          (unsigned long)edges, (unsigned long)n);
+                }
+            }
         }
     }
 }
