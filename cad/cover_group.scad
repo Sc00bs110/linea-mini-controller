@@ -53,20 +53,39 @@ disp_margin    = 1.0;    // aperture margin around active area
 pod_wall       = 3;      // frame walls + face skin thickness
 pod_clear      = 0.6;    // module fit clearance
 disp_boss_h    = 4;      // module standoff behind the face skin
-wire_space     = 12;     // housing depth behind the module (harness room;
-                         // the back is open, so this is retention, not limit)
+wire_space     = 15;     // housing depth behind the module: harness room PLUS
+                         // the FireBeetle stack on the back cover (cover 2 +
+                         // boss 3 + board 1.6 + components ~4 = ~10.6)
 cheek_t        = 3;      // support cheek (gusset) thickness
+
+// Snap-in back cover (second printed part -- see render_part below)
+cover_t        = 2;      // cover plate thickness
+cover_clear    = 0.3;    // fit clearance inside the cavity
+tab_w          = 12;     // snap tab width
+tab_t          = 1.6;    // snap tab thickness (flexes to clear the nub)
+tab_reach      = 14;     // how far tabs extend into the cavity
+nub_z          = 9.5;    // nub shoulder height above the cover back face
+nub_proud      = 0.8;    // how far the nub protrudes into the wall slot
+notch_w        = 40;     // harness notch in the cover's bottom edge
+notch_h        = 8;
 
 cable_slot_w   = 40;     // slot through the panel under the open back
 cable_slot_l   = 12;
 
-// ── PARAMETERS — ESP32-S3 mounting (under-panel, left of the pod) ────────────
-s3_holes       = true;   // 4 through-holes for nylon standoffs
-s3_hole_d      = 2.2;    // M2 standoff screws (DFR0975 has 2.0mm holes)
-s3_hole_dx     = 51.4;   // DFR0975 hole grid (from DFR0975_2D_CAD.png:
-s3_hole_dy     = 22;     // 25.4 x 61.47 board, holes 22 x ~51.4)
-s3_center_x    = 150;
-s3_center_y    = 60;
+// ── PARAMETERS — ESP32-S3 (FireBeetle DFR0975) mounting ──────────────────────
+// The board mounts on M2 bosses printed on the INSIDE of the snap-in back
+// cover, long axis horizontal, components facing the display. Grid from
+// DFR0975_2D_CAD.png: 25.4 x 61.47 board, 2.0mm holes at 22 x ~51.4.
+s3_boss_dx     = 51.4;   // hole grid along the board (horizontal in the pod)
+s3_boss_dy     = 22;     // hole grid across the board
+s3_boss_h      = 3;      // standoff height off the cover plate
+s3_boss_hole_d = 1.8;    // self-tap M2
+
+// What to render (edit + F5/F6):
+//   "all"        assembly preview: panel + pod + cover snapped in place
+//   "main"       panel + pod only -> export cover_group.stl
+//   "back_cover" cover alone, flat on the bed -> export cover_group_back.stl
+render_part    = "all";
 
 $fn = 48;
 
@@ -108,12 +127,6 @@ module panel() {
             rotate([0, 0, -disp_yaw])
                 translate([-cable_slot_w/2, -foot_mid + 4, 0])
                     cube([cable_slot_w, cable_slot_l, panel_thick + 2]);
-        // S3 standoff holes
-        if (s3_holes)
-            for (dx = [-s3_hole_dx/2, s3_hole_dx/2],
-                 dy = [-s3_hole_dy/2, s3_hole_dy/2])
-                translate([s3_center_x + dx, s3_center_y + dy, -1])
-                    cylinder(d = s3_hole_d, h = panel_thick + 2);
     }
 }
 
@@ -151,6 +164,13 @@ module display_pod() {
                 cube([disp_view_w + 2*disp_margin,
                       disp_view_h + 2*disp_margin,
                       pod_wall + 2]);
+            // snap slots through both side walls for the back cover's tabs
+            // (nub shoulder at z_t=nub_z; 0.5 engagement clearance)
+            for (sx = [-1, 1])
+                translate([sx > 0 ? slab_w/2 - pod_wall - 0.2 : -slab_w/2 - 1,
+                           slab_l/2 - (tab_w + 4)/2,
+                           nub_z + 0.5])
+                    cube([pod_wall + 1.2, tab_w + 4, 3.5]);
         }
         // M2 bosses hanging from the back of the face skin; the module
         // slides in through the open back and screws onto these
@@ -184,7 +204,62 @@ module display_pod() {
                          [footY0, housing_t * cos(disp_angle)]]);
 }
 
-// ── Assembly ─────────────────────────────────────────────────────────────────
-panel();
-pod_transform()
-    display_pod();
+// ── Snap-in back cover (second printed part) ─────────────────────────────────
+// Local frame = print orientation: plate flat on the bed (z=0..cover_t),
+// x centred, y from 0; tabs and the FireBeetle bosses rise in +z. In the
+// assembly this frame maps 1:1 onto the housing's tilt frame (plate sits in
+// the open back, tabs reach forward toward the face).
+cav_w = slab_w - 2*pod_wall;   // cavity width
+cav_l = slab_l - 2*pod_wall;   // cavity length (along the slope)
+
+module back_cover() {
+    // plate with harness notch at the bottom edge
+    difference() {
+        translate([0, cover_clear, 0])
+            linear_extrude(cover_t)
+                rounded_rect(cav_w - 2*cover_clear, cav_l - 2*cover_clear, 2);
+        translate([-notch_w/2, -1, -1])
+            cube([notch_w, notch_h + 1, cover_t + 2]);
+    }
+    // snap tabs on the side edges: thin fingers with a ramped nub that
+    // clicks outward into the wall slots (lead-in ramp faces the insertion
+    // direction; the square shoulder at nub_z resists pull-out)
+    for (sx = [-1, 1]) {
+        sxo = sx * (cav_w/2 - cover_clear);           // tab outer face x
+        ty  = cav_l/2 - tab_w/2;                      // tab bottom-edge y
+        translate([sx > 0 ? sxo - tab_t : sxo, ty, 0])
+            cube([tab_t, tab_w, tab_reach]);
+        // nub: hull of a tall thin strip at the face (ramp top) and a short
+        // proud strip (shoulder bottom)
+        hull() {
+            translate([sx > 0 ? sxo - 0.1 : sxo, ty, nub_z])
+                cube([0.1, tab_w, 3.5]);
+            translate([sx > 0 ? sxo : sxo - nub_proud, ty, nub_z])
+                cube([nub_proud, tab_w, 2]);
+        }
+    }
+    // FireBeetle DFR0975 bosses (board horizontal, components facing the
+    // display; M2 self-tap)
+    for (dx = [-s3_boss_dx/2, s3_boss_dx/2],
+         dy = [-s3_boss_dy/2, s3_boss_dy/2])
+        translate([dx, cav_l/2 + dy, cover_t])
+            difference() {
+                cylinder(d = 5, h = s3_boss_h);
+                translate([0, 0, 0.5])
+                    cylinder(d = s3_boss_hole_d, h = s3_boss_h + 1);
+            }
+}
+
+// ── Assembly / part selection ────────────────────────────────────────────────
+if (render_part != "back_cover") {
+    panel();
+    pod_transform()
+        display_pod();
+}
+if (render_part == "all")
+    pod_transform()
+        tilt()
+            translate([0, pod_wall, 0])
+                back_cover();
+if (render_part == "back_cover")
+    back_cover();
