@@ -165,17 +165,21 @@ module display_pod() {
     }
     // support cheeks: triangular gussets from the panel up the housing's
     // side-wall bottom edges (hypotenuse lies along the open-back plane)
+    // (front vertex nudged -0.5 so the gusset overlaps the housing volume
+    // instead of sharing a coincident plane -- keeps the mesh manifold)
     for (sx = [-slab_w/2, slab_w/2 - cheek_t])
         translate([sx, 0, 0])
             rotate([90, 0, 90])
                 linear_extrude(cheek_t)
-                    polygon([[0, 0], [footY1, 0], [footY1, cheek_h]]);
+                    polygon([[-0.5, 0], [footY1, 0], [footY1, cheek_h]]);
     // front apron: closes the gap between the face's bottom lip and the
     // panel (the housing leans forward of its resting edge)
+    // (rear vertex nudged +0.5 into the housing footprint for the same
+    // manifold-overlap reason as the cheeks)
     translate([-slab_w/2, 0, 0])
         rotate([90, 0, 90])
             linear_extrude(slab_w)
-                polygon([[0, 0],
+                polygon([[0.5, 0],
                          [footY0, 0],
                          [footY0, housing_t * cos(disp_angle)]]);
 }
