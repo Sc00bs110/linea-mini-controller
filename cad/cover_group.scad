@@ -88,7 +88,7 @@ s3_boss_hole_d = 1.8;    // self-tap M2
 //   "fit_test"   first fit_test_h mm of the main part only -- quick print to
 //                verify outline/holes/pod footprint against the machine
 render_part    = "all";
-fit_test_h     = 4;      // fit-test slice height (mm)
+fit_test_h     = 1;      // fit-test slice height (mm)
 
 $fn = 48;
 
