@@ -85,7 +85,10 @@ s3_boss_hole_d = 1.8;    // self-tap M2
 //   "all"        assembly preview: panel + pod + cover snapped in place
 //   "main"       panel + pod only -> export cover_group.stl
 //   "back_cover" cover alone, flat on the bed -> export cover_group_back.stl
+//   "fit_test"   first fit_test_h mm of the main part only -- quick print to
+//                verify outline/holes/pod footprint against the machine
 render_part    = "all";
+fit_test_h     = 4;      // fit-test slice height (mm)
 
 $fn = 48;
 
@@ -251,7 +254,17 @@ module back_cover() {
 }
 
 // ── Assembly / part selection ────────────────────────────────────────────────
-if (render_part != "back_cover") {
+if (render_part == "fit_test")
+    intersection() {
+        union() {
+            panel();
+            pod_transform()
+                display_pod();
+        }
+        translate([-5, -5, -1])
+            cube([panel_len + 10, panel_wid + 10, fit_test_h + 1]);
+    }
+if (render_part != "back_cover" && render_part != "fit_test") {
     panel();
     pod_transform()
         display_pod();
