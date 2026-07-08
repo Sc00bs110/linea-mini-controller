@@ -30,7 +30,9 @@ panel_wid      = 130;
 panel_thick    = 3;
 corner_r       = 4;
 mount_hole_d   = 5.0;
-mount_holes    = [ [10,18], [290,18], [10,112], [290,112] ];
+// 9mm in from left/right edges, 18mm in from front/back (re-measured
+// 2026-07-08 after the first fit test: was 10mm, holes sat 1mm outboard)
+mount_holes    = [ [9,18], [291,18], [9,112], [291,112] ];
 
 // ── PARAMETERS — display pod ─────────────────────────────────────────────────
 disp_angle     = 70;     // screen tilt from horizontal (deg)
