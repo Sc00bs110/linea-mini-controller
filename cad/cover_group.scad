@@ -56,9 +56,9 @@ cable_slot_l   = 12;
 
 // ── PARAMETERS — ESP32-S3 mounting (under-panel, left of the pod) ────────────
 s3_holes       = true;   // 4 through-holes for nylon standoffs
-s3_hole_d      = 2.7;    // M2.5 standoff screws
-s3_hole_dx     = 55;     // MEASURE against your DFR0975 + wiring
-s3_hole_dy     = 20;
+s3_hole_d      = 2.2;    // M2 standoff screws (DFR0975 has 2.0mm holes)
+s3_hole_dx     = 51.4;   // DFR0975 hole grid (from DFR0975_2D_CAD.png:
+s3_hole_dy     = 22;     // 25.4 x 61.47 board, holes 22 x ~51.4)
 s3_center_x    = 150;    // left of the pod, wires reach the cable slot
 s3_center_y    = 60;
 
