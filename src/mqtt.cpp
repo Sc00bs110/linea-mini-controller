@@ -64,10 +64,11 @@ static void on_msg(const char* topic, byte* payload, unsigned int len) {
     } else if (strcmp(topic, MQTT_CMD_CLEAN) == 0) {
         machine_clean_start();
         time_t now = time(nullptr);
-        if (now > 1577836800UL) {  // sanity: after 2020-01-01
+        // The epoch needs sane (NTP) time; the counter reset must not wait on it.
+        if (now > 1577836800UL)    // sanity: after 2020-01-01
             settings.last_cleaning_epoch = (uint32_t)now;
-            settings_save();
-        }
+        settings.shots_since_clean = 0;
+        settings_save();
     }
 }
 
@@ -122,6 +123,12 @@ static void publish_discovery() {
         "\"state_class\":\"total_increasing\"," AVAIL_J "," DEV_J "}");
 
     pub_retained(
+        HA_BASE "/sensor/lm_mini/shots_since_clean/config",
+        "{\"name\":\"Shots since clean\",\"uniq_id\":\"lm_mini_shots_since_clean\","
+        "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.shots_since_clean}}\","
+        "\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
+
+    pub_retained(
         HA_BASE "/sensor/lm_mini/last_cleaning/config",
         "{\"name\":\"Last Cleaning\",\"uniq_id\":\"lm_mini_last_clean\","
         "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.last_clean}}\","
@@ -149,7 +156,7 @@ static void publish_discovery() {
         "\"dev_cla\":\"temperature\",\"unit_of_meas\":\"\\u00b0C\","
         "\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (10 entities)\n");
+    wlogf("[mqtt] HA discovery published (11 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -171,10 +178,10 @@ static void publish_state() {
     bool in_frame; int rxlen;
     gicar_rx_state(&in_frame, &rxlen);
 
-    char state[384];
+    char state[416];
     snprintf(state, sizeof(state),
         "{\"temp\":%.1f,\"target_temp\":%.1f,\"machine_setpoint\":%.1f,\"brew\":\"%s\","
-        "\"steam\":\"%s\",\"standby\":\"%s\",\"shots\":%u,\"last_clean\":\"%s\","
+        "\"steam\":\"%s\",\"standby\":\"%s\",\"shots\":%u,\"shots_since_clean\":%u,\"last_clean\":\"%s\","
         "\"machine\":\"%s\",\"scale\":\"%s\",\"weight\":%.1f,"
         "\"rx\":%lu,\"in_frame\":%d,\"rxlen\":%d,\"dbg\":\"%s\"}",
         machine.coffee_temp_c,
@@ -184,6 +191,7 @@ static void publish_state() {
         machine.steam_active  ? "ON" : "OFF",
         machine.standby       ? "ON" : "OFF",
         (unsigned)settings.shot_count,
+        (unsigned)settings.shots_since_clean,
         clean_str,
         machine.connected    ? "ON" : "OFF",
         scale_connected()    ? "ON" : "OFF",

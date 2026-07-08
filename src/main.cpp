@@ -72,11 +72,16 @@ static void ota_task(void*) {
 
     ArduinoOTA.onStart([]() {
         Serial.println("OTA start");
+        // Stop BLE scanning for the duration of the transfer — scan bursts on
+        // the shared 2.4GHz radio stall the OTA TCP stream (proven 2026-07-08:
+        // repeated mid-transfer aborts exactly while "[scale] scanning" ran).
+        scale_set_ota_hold(true);
         ui_ota_start();
     });
     ArduinoOTA.onEnd([]()   { Serial.println("\nOTA done"); });
     ArduinoOTA.onError([](ota_error_t e) {
         Serial.printf("OTA error[%u]\n", e);
+        scale_set_ota_hold(false);   // resume scanning after a failed transfer
     });
 
     bool armed = false;

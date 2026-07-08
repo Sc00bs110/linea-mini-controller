@@ -28,3 +28,8 @@ void  scale_tare_and_start();
 bool        scale_connected();
 float       scale_weight();         // current weight in grams (0.0 if disconnected)
 const char* scale_model_name();     // "Felicita Arc" / "Bookoo Themis Ultra" / "—"
+
+// Suspend/resume BLE scanning while an OTA transfer runs — scanning on the
+// shared 2.4GHz radio stalls the OTA TCP stream (proven live 2026-07-08:
+// transfers died mid-stream exactly while "[scale] scanning" was active).
+void scale_set_ota_hold(bool hold);

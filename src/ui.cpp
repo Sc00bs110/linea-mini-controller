@@ -518,8 +518,9 @@ static void ui_main_update() {
     else
         lv_obj_add_flag(lbl_brew, LV_OBJ_FLAG_HIDDEN);
 
-    char sbuf[16];
-    snprintf(sbuf, sizeof(sbuf), "%u shots", (unsigned)settings.shot_count);
+    char sbuf[48];
+    snprintf(sbuf, sizeof(sbuf), "%u shots \xC2\xB7 %u since clean",
+             (unsigned)settings.shot_count, (unsigned)settings.shots_since_clean);
     lv_label_set_text(lbl_shots, sbuf);
 
     target_show();   // tracks changes made on the Settings screen too
@@ -1485,10 +1486,11 @@ void ui_tick() {
         lv_obj_set_style_text_color(lbl_clean, lv_color_make(0xCC, 0xCC, 0xCC), 0);
         machine_clean_start();
         time_t now = time(nullptr);
-        if (now > 1577836800UL) {  // sanity: after 2020-01-01
+        // The epoch needs sane (NTP) time; the counter reset must not wait on it.
+        if (now > 1577836800UL)    // sanity: after 2020-01-01
             settings.last_cleaning_epoch = (uint32_t)now;
-            settings_save();
-        }
+        settings.shots_since_clean = 0;
+        settings_save();
         s_clean_stage = CLEAN_PREP;
         lv_label_set_text(lbl_clean_overlay_title, "Cleaning cycle");
         lv_label_set_text(lbl_clean_overlay_sub,
@@ -1605,7 +1607,7 @@ void ui_tick() {
     if (!was_brew && brew_now) {
         brew_start_ms  = millis();
         // Clean-cycle pump phases are not shots.
-        if (!machine_clean_active()) settings.shot_count++;
+        if (!machine_clean_active()) { settings.shot_count++; settings.shots_since_clean++; }
         scale_tare_and_start();
         bbw_stop_fired = false;
         // During a cleaning cycle the overlay is the UI — no shot timer.

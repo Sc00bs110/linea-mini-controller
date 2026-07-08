@@ -39,6 +39,7 @@ ScaleState scale = { SCALE_NONE, false, 0.0f, 0.0f, 0, 0, true };
 static NimBLEAddress s_target_addr;
 static ScaleModel    s_target_model = SCALE_NONE;
 static bool          s_found = false;
+static volatile bool s_ota_hold = false;  // set from the OTA task (see scale.h)
 
 // Bookoo write characteristic — only valid while BLE task holds an active connection.
 // Commands from other tasks are queued via s_bookoo_pending_cmd instead of calling
@@ -230,8 +231,9 @@ static void scale_ble_task(void*) {
     for (;;) {
         // Don't scan during an active brew — BLE scan disrupts the shared WiFi
         // radio and can corrupt R-frame responses. The scale isn't needed for
-        // reconnection mid-shot; wait until the shot ends.
-        while (machine.brew_active) vTaskDelay(pdMS_TO_TICKS(500));
+        // reconnection mid-shot; wait until the shot ends. Same hold applies
+        // during an OTA transfer (see scale_set_ota_hold).
+        while (machine.brew_active || s_ota_hold) vTaskDelay(pdMS_TO_TICKS(500));
 
         s_found       = false;
         s_target_model = SCALE_NONE;
@@ -360,5 +362,15 @@ const char* scale_model_name() {
         case SCALE_FELICITA_ARC:    return "Felicita Arc";
         case SCALE_BOOKOO_THEMIS:   return "Bookoo Themis Ultra";
         default:                    return "—";
+    }
+}
+
+void scale_set_ota_hold(bool hold) {
+    s_ota_hold = hold;
+    // A 10s scan may already be in flight — kill it now rather than letting
+    // it fight the OTA stream for the radio. Safe if BLE isn't initialized
+    // yet (task not started / pre-WiFi): guard on init state.
+    if (hold && NimBLEDevice::isInitialized()) {
+        NimBLEDevice::getScan()->stop();
     }
 }
