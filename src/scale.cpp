@@ -40,6 +40,10 @@ static NimBLEAddress s_target_addr;
 static ScaleModel    s_target_model = SCALE_NONE;
 static bool          s_found = false;
 static volatile bool s_ota_hold = false;  // set from the OTA task (see scale.h)
+// True only while the scale task is parked at its gate (no NimBLE calls in
+// flight). scale_radio_release() waits for this before NimBLEDevice::deinit(),
+// making the cross-task deinit race-free.
+static volatile bool s_ble_parked = false;
 
 // Bookoo write characteristic — only valid while BLE task holds an active connection.
 // Commands from other tasks are queued via s_bookoo_pending_cmd instead of calling
@@ -232,8 +236,14 @@ static void scale_ble_task(void*) {
         // Don't scan during an active brew — BLE scan disrupts the shared WiFi
         // radio and can corrupt R-frame responses. The scale isn't needed for
         // reconnection mid-shot; wait until the shot ends. Same hold applies
-        // during an OTA transfer (see scale_set_ota_hold).
-        while (machine.brew_active || s_ota_hold) vTaskDelay(pdMS_TO_TICKS(500));
+        // during an OTA transfer (see scale_set_ota_hold / scale_radio_release).
+        // Publish s_ble_parked while waiting so scale_radio_release() can safely
+        // deinit BLE from another task: no NimBLE calls run on this task here.
+        if (machine.brew_active || s_ota_hold) {
+            s_ble_parked = true;
+            while (machine.brew_active || s_ota_hold) vTaskDelay(pdMS_TO_TICKS(500));
+            s_ble_parked = false;
+        }
 
         s_found       = false;
         s_target_model = SCALE_NONE;
@@ -246,8 +256,14 @@ static void scale_ble_task(void*) {
         // this wait, s_found was checked microseconds after the scan began,
         // so the connect path below never executed.
         pScan->start(10000, true);
-        for (int i = 0; i < 100 && !s_found; i++) vTaskDelay(pdMS_TO_TICKS(100));
+        // Also break on s_ota_hold: without it, an OTA radio-release that lands
+        // mid-scan would wait out the full ~10s here before the task could park,
+        // overrunning scale_radio_release()'s deinit wait (race → crash).
+        for (int i = 0; i < 100 && !s_found && !s_ota_hold; i++) vTaskDelay(pdMS_TO_TICKS(100));
         pScan->stop();
+
+        // OTA release requested during the scan window — park now (gate at top).
+        if (s_ota_hold) continue;
 
         if (!s_found) {
             // 30s pause between scans when no scale found — BLE scan thrashes the
@@ -295,7 +311,9 @@ static void scale_ble_task(void*) {
         wlogf("[scale] %s connected\n", scale_model_name());
 
         // ── Stay connected ───────────────────────────────────────────────────
-        while (pClient->isConnected()) {
+        // Break on s_ota_hold so an OTA radio release can proceed: the loop exits,
+        // the client is cleaned up below, and the task parks at the gate.
+        while (pClient->isConnected() && !s_ota_hold) {
             // Drain pending command queue (Bookoo only)
             if (s_target_model == SCALE_BOOKOO_THEMIS) {
                 uint8_t cmd = s_bookoo_pending_cmd;
@@ -373,4 +391,32 @@ void scale_set_ota_hold(bool hold) {
     if (hold && NimBLEDevice::isInitialized()) {
         NimBLEDevice::getScan()->stop();
     }
+}
+
+void scale_radio_release() {
+    wlogf("[scale] radio release for OTA — parking task, deinit BLE\n");
+
+    // 1) Raise the hold so the scale task exits any scan/connect loop and heads
+    //    for its park gate; 2) kill any in-flight scan immediately.
+    s_ota_hold = true;
+    if (NimBLEDevice::isInitialized()) {
+        NimBLEDevice::getScan()->stop();
+    }
+
+    // 3) Wait for the task to reach the gate (s_ble_parked). With the hold
+    //    checks on every loop, the only blocking NimBLE call left is a ~5s
+    //    connect() (plus its 5s fail backoff), so 8s is a safe upper bound: by
+    //    then the task holds no NimBLE calls even if s_ble_parked never flipped.
+    for (int i = 0; i < 80 && !s_ble_parked; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // 4) Fully free the radio for WiFi. Pausing the scan is not enough on the
+    //    S3's single shared 2.4GHz radio; deinit(true) also clears NimBLE state
+    //    so WiFi.setSleep(false) becomes legal. A reboot (every OTA path) brings
+    //    BLE back up from scratch — no resume needed.
+    if (NimBLEDevice::isInitialized()) {
+        NimBLEDevice::deinit(true);
+    }
+    wlogf("[scale] BLE deinitialized (parked=%d)\n", s_ble_parked ? 1 : 0);
 }

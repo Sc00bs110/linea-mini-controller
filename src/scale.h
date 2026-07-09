@@ -33,3 +33,11 @@ const char* scale_model_name();     // "Felicita Arc" / "Bookoo Themis Ultra" / 
 // shared 2.4GHz radio stalls the OTA TCP stream (proven live 2026-07-08:
 // transfers died mid-stream exactly while "[scale] scanning" was active).
 void scale_set_ota_hold(bool hold);
+
+// Fully release the 2.4GHz radio for an OTA transfer. Pausing the scan is not
+// enough on the S3's single shared radio — this parks the scale task, stops any
+// active scan, disconnects a connected client, then NimBLEDevice::deinit()s to
+// free the radio entirely so WiFi.setSleep(false) becomes legal. No resume: all
+// OTA paths reboot (success or failure), which restores BLE from scratch. Safe
+// to call from another task while the scale task is mid-scan/mid-connect.
+void scale_radio_release();

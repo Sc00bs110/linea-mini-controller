@@ -4,6 +4,7 @@
 #include "scale.h"
 #include "gicar.h"
 #include "wlog.h"
+#include "ota_http.h"
 #include "secrets.h"
 #include <PubSubClient.h>
 #include <WiFiClient.h>
@@ -20,7 +21,12 @@
 #define MQTT_CMD_STEAM  MQTT_BASE "/cmd/steam"
 #define MQTT_CMD_CLEAN  MQTT_BASE "/cmd/clean"
 #define MQTT_CMD_STANDBY MQTT_BASE "/cmd/standby"
+#define MQTT_CMD_OTA    MQTT_BASE "/cmd/ota"
 #define HA_BASE         "homeassistant"
+
+// Default firmware URL used when the ota command payload is "PRESS" (the HA
+// button). 192.168.1.62 is the build PC, which serves firmware.bin on :8070.
+#define OTA_DEFAULT_URL "http://192.168.1.62:8070/firmware.bin"
 
 // Shared JSON fragments — embedded via compile-time string concatenation
 #define AVAIL_J \
@@ -42,7 +48,9 @@ static PubSubClient s_client(s_net);
 // ─── Command handler ──────────────────────────────────────────────────────────
 
 static void on_msg(const char* topic, byte* payload, unsigned int len) {
-    char val[32] = {};
+    // Sized for the longest expected payload: a full firmware URL on cmd/ota
+    // (val[32] truncated it to ".../firmwa" — field-debugged 2026-07-09).
+    char val[160] = {};
     if (len > sizeof(val) - 1) len = sizeof(val) - 1;
     memcpy(val, payload, len);
 
@@ -69,6 +77,18 @@ static void on_msg(const char* topic, byte* payload, unsigned int len) {
             settings.last_cleaning_epoch = (uint32_t)now;
         settings.shots_since_clean = 0;
         settings_save();
+
+    } else if (strcmp(topic, MQTT_CMD_OTA) == 0) {
+        // A full URL triggers a pull from that URL; "PRESS" (the HA button) uses
+        // the default build-PC URL. Queue it — the update must NOT run inside
+        // this callback (long/blocking + reconfigures the radio).
+        if (strncmp(val, "http://", 7) == 0) {
+            ota_http_request(val);
+        } else if (strcmp(val, "PRESS") == 0) {
+            ota_http_request(OTA_DEFAULT_URL);
+        } else {
+            wlogf("[mqtt] ota: ignoring payload '%s'\n", val);
+        }
     }
 }
 
@@ -156,7 +176,15 @@ static void publish_discovery() {
         "\"dev_cla\":\"temperature\",\"unit_of_meas\":\"\\u00b0C\","
         "\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (11 entities)\n");
+    // Firmware OTA trigger — press publishes "PRESS" to the ota command topic,
+    // which pulls firmware.bin from the build PC (see OTA_DEFAULT_URL).
+    pub_retained(
+        HA_BASE "/button/lm_mini/update_fw/config",
+        "{\"name\":\"Update firmware\",\"uniq_id\":\"lm_mini_update_fw\","
+        "\"cmd_t\":\"" MQTT_CMD_OTA "\",\"pl_prs\":\"PRESS\","
+        AVAIL_J "," DEV_J "}");
+
+    wlogf("[mqtt] HA discovery published (12 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -229,6 +257,7 @@ static bool do_connect() {
     s_client.subscribe(MQTT_CMD_STEAM);
     s_client.subscribe(MQTT_CMD_STANDBY);
     s_client.subscribe(MQTT_CMD_CLEAN);
+    s_client.subscribe(MQTT_CMD_OTA);
     publish_discovery();
     wlogf("[mqtt] connected as %s\n", client_id);
     return true;

@@ -23,7 +23,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.23"  // bump on every deployed update (user convention)
+#define FW_VERSION "v0.24"  // bump on every deployed update (user convention)
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
