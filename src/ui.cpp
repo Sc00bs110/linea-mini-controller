@@ -23,7 +23,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.22"
+#define FW_VERSION "v0.23"  // bump on every deployed update (user convention)
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -49,8 +49,9 @@ enum SettingsItem {
     SI_PRESTOP,      // 5  0.0–8.0 g, step 0.5 g
     SI_STEAM,        // 6  ON / OFF
     SI_WIFI,         // 7  navigate → WiFi status screen
-    SI_BACK,         // 8  action — save + return to main
-    SI_COUNT         // 9
+    SI_CLEAN_INT,    // 8  shots between cleaning cycles, 10..100 step 5
+    SI_BACK,         // 9  action — save + return to main
+    SI_COUNT         // 10
 };
 // Clean cycle moved to a hold-to-start button on the Main screen (v0.16);
 // coffee temp moved to the main-screen edge adjuster (v0.20).
@@ -64,6 +65,7 @@ static const char *item_names[SI_COUNT] = {
     "Pre-stop offset",
     "Steam",
     "WiFi",
+    "Clean interval",
     "Back"
 };
 
@@ -518,9 +520,18 @@ static void ui_main_update() {
     else
         lv_obj_add_flag(lbl_brew, LV_OBJ_FLAG_HIDDEN);
 
+    // Cleaning countdown, not totals — the running shot count lives in Home
+    // Assistant now. remaining = shots left before the next cleaning cycle.
     char sbuf[48];
-    snprintf(sbuf, sizeof(sbuf), "%u shots \xC2\xB7 %u since clean",
-             (unsigned)settings.shot_count, (unsigned)settings.shots_since_clean);
+    unsigned remaining = (settings.clean_interval > settings.shots_since_clean)
+                         ? (unsigned)(settings.clean_interval - settings.shots_since_clean) : 0;
+    if (remaining > 0) {
+        snprintf(sbuf, sizeof(sbuf), "Clean in %u shots", remaining);
+        lv_obj_set_style_text_color(lbl_shots, lv_color_make(0x90, 0x90, 0x90), 0);
+    } else {
+        snprintf(sbuf, sizeof(sbuf), "Clean cycle due");
+        lv_obj_set_style_text_color(lbl_shots, lv_color_make(0xE5, 0x39, 0x35), 0);
+    }
     lv_label_set_text(lbl_shots, sbuf);
 
     target_show();   // tracks changes made on the Settings screen too
@@ -757,6 +768,8 @@ static const char* get_item_val(int i) {
             snprintf(buf, sizeof(buf), "%.0f g", settings.brew_target_g); break;
         case SI_PRESTOP:
             snprintf(buf, sizeof(buf), "%.1f g", settings.prestop_offset_g); break;
+        case SI_CLEAN_INT:
+            snprintf(buf, sizeof(buf), "%u shots", settings.clean_interval); break;
         case SI_BACK:
             buf[0] = '\0'; break;
         default:
@@ -944,6 +957,10 @@ static void settings_edit_increment() {
         case SI_TIMEZONE:
             settings.tz_offset_min += 30;
             if (settings.tz_offset_min > 840) settings.tz_offset_min = -720;  // +14h..-12h
+            break;
+        case SI_CLEAN_INT:
+            settings.clean_interval += 5;
+            if (settings.clean_interval > 100) settings.clean_interval = 10;
             break;
         // SI_SCHEDULE, SI_WIFI, SI_BACK: no increment (navigation items)
     }
@@ -1366,7 +1383,9 @@ static void ui_show_main() {
 static void ui_show_timer() {
     cur_screen = UI_TIMER;
     char sbuf[16];
-    snprintf(sbuf, sizeof(sbuf), "Shot #%u", (unsigned)settings.shot_count);
+    // +1: the increment now happens at shot end, so during the pull the
+    // presumptive number is one past the stored total.
+    snprintf(sbuf, sizeof(sbuf), "Shot #%u", (unsigned)settings.shot_count + 1);
     lv_label_set_text(lbl_timer_shots, sbuf);
     lv_bar_set_range(weight_bar, 0, (int)(settings.brew_target_g * 10));
     lv_bar_set_value(weight_bar, 0, LV_ANIM_OFF);
@@ -1606,8 +1625,6 @@ void ui_tick() {
 
     if (!was_brew && brew_now) {
         brew_start_ms  = millis();
-        // Clean-cycle pump phases are not shots.
-        if (!machine_clean_active()) { settings.shot_count++; settings.shots_since_clean++; }
         scale_tare_and_start();
         bbw_stop_fired = false;
         // During a cleaning cycle the overlay is the UI — no shot timer.
@@ -1627,6 +1644,12 @@ void ui_tick() {
     if (was_brew && !brew_now) {
         brew_end_ms    = millis();
         returning_brew = true;
+        // Count as a shot only if the pump ran >= 20 s; shorter runs are a
+        // group-head flush, not a pull. Clean-cycle pump phases are not shots.
+        if ((brew_end_ms - brew_start_ms) >= 20000 && !machine_clean_active()) {
+            settings.shot_count++;
+            settings.shots_since_clean++;
+        }
         // Arm auto-offset learning only for shots this firmware stopped.
         if (bbw_stop_fired && scale_connected()) s_bbw_settle_ms = millis();
     }

@@ -1,8 +1,8 @@
 #include "settings.h"
 #include <Preferences.h>
 
-Settings settings = { 93.5f, 0.0f, false, 0, 36.0f, 3.0f, 0, 0, 0,
-                      false, 390, 1200, 120 };  // schedule off, 06:30/20:00, UTC+2
+Settings settings = { 93.5f, 0.0f, false, 0, 36.0f, 3.0f, 0, 0, 0, 50,
+                      false, 390, 1200, 120 };  // clean every 50 shots; schedule off, 06:30/20:00, UTC+2
 
 void settings_init() {
     Preferences prefs;
@@ -16,16 +16,18 @@ void settings_init() {
     settings.shot_count          = prefs.getUInt( "shots",    0);
     settings.last_cleaning_epoch = prefs.getUInt( "clean_ts", 0);
     settings.shots_since_clean   = prefs.getUInt( "shots_cln", 0);
+    settings.clean_interval      = prefs.getUShort("clean_int", 50);
     settings.sched_enabled       = prefs.getBool(  "sched_en", false);
     settings.sched_wake_min      = prefs.getUShort("sched_wk", 390);
     settings.sched_sleep_min     = prefs.getUShort("sched_sl", 1200);
     settings.tz_offset_min       = prefs.getShort( "tz_min",   120);
     prefs.end();
     Serial.printf("[settings] loaded: temp=%.1f preinf=%.1f steam=%d standby=%d "
-                  "brewwt=%.0f prestop=%.1f shots=%u clean=%u shots_cln=%u\n",
+                  "brewwt=%.0f prestop=%.1f shots=%u clean=%u shots_cln=%u clean_int=%u\n",
                   settings.coffee_temp_c, settings.preinfusion_s, settings.steam_on,
                   settings.standby_min, settings.brew_target_g, settings.prestop_offset_g,
-                  settings.shot_count, settings.last_cleaning_epoch, settings.shots_since_clean);
+                  settings.shot_count, settings.last_cleaning_epoch, settings.shots_since_clean,
+                  settings.clean_interval);
 }
 
 void settings_save() {
@@ -40,6 +42,7 @@ void settings_save() {
     prefs.putUInt( "shots",    settings.shot_count);
     prefs.putUInt( "clean_ts", settings.last_cleaning_epoch);
     prefs.putUInt( "shots_cln", settings.shots_since_clean);
+    prefs.putUShort("clean_int", settings.clean_interval);
     prefs.putBool(  "sched_en", settings.sched_enabled);
     prefs.putUShort("sched_wk", settings.sched_wake_min);
     prefs.putUShort("sched_sl", settings.sched_sleep_min);

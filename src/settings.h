@@ -12,6 +12,7 @@ struct Settings {
     uint32_t shot_count;          // total shots pulled, persisted to NVS
     uint32_t last_cleaning_epoch; // Unix timestamp of last cleaning (0 = never)
     uint32_t shots_since_clean;  // shots since the last cleaning cycle, persisted to NVS
+    uint16_t clean_interval;     // shots between cleaning cycles; settings-menu item
 
     // Standby schedule (v0.21): absolute-time daily sleep/wake, minutes since
     // local midnight. Distinct from standby_min (the idle timeout).
