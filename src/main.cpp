@@ -85,6 +85,12 @@ static void ota_task(void*) {
         ui_ota_start();
     });
     ArduinoOTA.onEnd([]()   { Serial.println("\nOTA done"); });
+    ArduinoOTA.onProgress([](unsigned int prog, unsigned int total) {
+        // Feed the same on-screen percent readout the manual OTA path drives
+        // (main-screen diagnostic line, via ota_http_progress()). Plain volatile
+        // write — no LVGL here, safe from this OTA task.
+        if (total) ota_http_set_progress((uint8_t)((uint64_t)prog * 100 / total));
+    });
     ArduinoOTA.onError([](ota_error_t e) {
         Serial.printf("OTA error[%u]\n", e);
         // A failed transfer wedges the Update state machine (arduino-esp32

@@ -87,6 +87,11 @@ static lv_obj_t *scr_wifi_ap;
 enum UiScreen { UI_MAIN, UI_TIMER, UI_SETTINGS, UI_WIFI, UI_WIFI_AP, UI_SCHED };
 static UiScreen cur_screen = UI_MAIN;
 
+// Set by ui_ota_start() when a transfer begins. While set, the main-screen
+// diagnostic line shows the OTA percent (ota_http_progress()) in place of the FW
+// version. Never cleared in-session — every OTA outcome reboots the board.
+static bool s_ota_active = false;
+
 // ─── Brew + shot tracking ──────────────────────────────────────────────────────
 static bool     was_brew       = false;
 static uint32_t brew_start_ms  = 0;
@@ -573,8 +578,16 @@ static void ui_main_update() {
         dot = lv_color_make(0x35, 0x35, 0x35);
     lv_obj_set_style_bg_color(led_status, dot, 0);
 
-    // FW version, always visible next to the dot.
-    lv_label_set_text(lbl_hint, FW_VERSION);
+    // Diagnostic line next to the status dot: the live OTA percent while a
+    // transfer is in flight, otherwise the firmware version.
+    if (s_ota_active) {
+        char ob[24];
+        snprintf(ob, sizeof(ob), "OTA: updating %u%%", (unsigned)ota_http_progress());
+        lv_label_set_text(lbl_hint, ob);
+        lv_obj_set_style_text_color(lbl_hint, lv_color_make(0xD4, 0x89, 0x1A), 0);
+    } else {
+        lv_label_set_text(lbl_hint, FW_VERSION);
+    }
 
     // Scheduled/commanded standby: cover the screen with the sleeping overlay.
     if (machine.standby) {
@@ -746,6 +759,15 @@ static lv_obj_t *settings_val_lbl[SI_COUNT];
 static int       settings_sel  = 0;
 static bool      settings_edit = false;
 
+#if defined(FEATURE_GH_OTA)
+// Firmware-update confirm gate. The first tap on "vX.YY - install" arms this
+// (the row flips to "Tap to confirm"); the second tap actually installs. Auto-
+// clears after ~10 s of inactivity (ui_tick) or when the settings screen is
+// re-entered (ui_show_settings) — a lightweight in-row confirmation, no modal.
+static bool      s_fw_confirm    = false;
+static uint32_t  s_fw_confirm_ms = 0;
+#endif
+
 static const char* get_item_val(int i) {
     static char buf[28];
     switch (i) {
@@ -784,7 +806,10 @@ static const char* get_item_val(int i) {
                 case GH_CHECKING:     snprintf(buf, sizeof(buf), "Checking..."); break;
                 case GH_UP_TO_DATE:   snprintf(buf, sizeof(buf), "Up to date");  break;
                 case GH_UPDATE_AVAIL:
-                    snprintf(buf, sizeof(buf), "%s - install", ota_gh_remote_version());
+                    if (s_fw_confirm)
+                        snprintf(buf, sizeof(buf), "Tap to confirm");
+                    else
+                        snprintf(buf, sizeof(buf), "%s - install", ota_gh_remote_version());
                     break;
                 case GH_CHECK_FAILED: snprintf(buf, sizeof(buf), "Check failed"); break;
                 case GH_IDLE:
@@ -941,9 +966,21 @@ static void settings_scroll() {
 // was already found) start the install. The install path hands off to the OTA
 // screen via ota_http_tick().
 static void settings_fw_update_activate() {
-    if (ota_gh_state() == GH_UPDATE_AVAIL) ota_gh_install();
-    else                                   ota_gh_check();
-    settings_draw();   // reflect "Checking..." immediately
+    if (ota_gh_state() == GH_UPDATE_AVAIL) {
+        if (!s_fw_confirm) {
+            // First tap: arm the confirm gate (row flips to "Tap to confirm").
+            s_fw_confirm    = true;
+            s_fw_confirm_ms = millis();
+        } else {
+            // Second tap: confirmed — hand off to the install (OTA) path.
+            s_fw_confirm = false;
+            ota_gh_install();
+        }
+    } else {
+        s_fw_confirm = false;
+        ota_gh_check();
+    }
+    settings_draw();   // reflect the new row text immediately
 }
 #endif
 
@@ -1440,6 +1477,9 @@ static void ui_show_timer() {
 static void ui_show_settings() {
     settings_sel  = 0;
     settings_edit = false;
+#if defined(FEATURE_GH_OTA)
+    s_fw_confirm  = false;   // fresh confirm gate on every entry to the screen
+#endif
     lv_label_set_text(lbl_settings_hdr, "SETTINGS");
     settings_draw();
     cur_screen = UI_SETTINGS;
@@ -1765,6 +1805,12 @@ void ui_tick() {
                         settings_draw();
                     }
                 }
+                // Auto-clear the install confirm gate after ~10 s of inactivity,
+                // so a stale "Tap to confirm" never installs on a much-later tap.
+                if (s_fw_confirm && millis() - s_fw_confirm_ms > 10000UL) {
+                    s_fw_confirm = false;
+                    settings_draw();
+                }
 #endif
                 break;
             case UI_WIFI_AP:  break;
@@ -1773,6 +1819,14 @@ void ui_tick() {
 }
 
 void ui_ota_start() {
-    lv_label_set_text(lbl_hint, "OTA updating...");
-    lv_timer_handler();
+    // Called from loop() context (ota_http_tick, and — pre-existing — the
+    // ArduinoOTA dev-push path). NOT from the transfer task: LVGL is not
+    // thread-safe. Show the OTA progress view on the main screen; the percent is
+    // then rendered by ui_main_update() polling ota_http_progress() each tick.
+    s_ota_active = true;
+    if (cur_screen != UI_MAIN) {
+        cur_screen = UI_MAIN;
+        lv_scr_load(scr_main);
+    }
+    lv_label_set_text(lbl_hint, "OTA: starting...");
 }

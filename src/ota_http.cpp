@@ -5,12 +5,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <HTTPUpdate.h>   // Arduino-ESP32 3.x bundled lib; global `httpUpdate`.
+#include <HTTPClient.h>   // manual streaming GET (both http:// and https:// paths)
+#include <Update.h>       // Update.begin/write/end — write the incoming image
 
 #if defined(FEATURE_GH_OTA)
 #include "version.h"          // FW_VERSION — the local version we compare against
 #include <WiFiClientSecure.h> // TLS client for the GitHub release fetch/install
-#include <HTTPClient.h>       // version.json GET
 #endif
 
 // Firmware URL requested via MQTT, serviced from loop() (never inside the MQTT
@@ -25,10 +25,28 @@ void ota_http_request(const char* url) {
     s_pending = true;
 }
 
-// Runs the actual transfer. Lives in its own dedicated task (not loop()):
-// the TLS install path needs ~16 KB of stack for the mbedtls handshake, and
-// fattening the loop task's stack for a once-per-update event would cost that
-// internal RAM permanently.
+// Transfer progress (0..100). Written by the transfer task (and by the
+// ArduinoOTA onProgress hook via ota_http_set_progress); read by the UI from
+// loop() context. volatile: cross-task publish with the reader polling it.
+static volatile uint8_t s_ota_pct = 0;
+
+// Re-entrancy guard. Set true once a transfer is spawned and never cleared: the
+// transfer always ends in ESP.restart(), so it resets naturally across reboot.
+// Prevents a second (radio-releasing, Update-owning) transfer from a stray tap.
+static volatile bool s_running = false;
+
+uint8_t ota_http_progress()                { return s_ota_pct; }
+void    ota_http_set_progress(uint8_t pct) { s_ota_pct = pct; }
+
+// Runs the actual transfer. Lives in its own dedicated task (not loop()): the
+// TLS install path needs ~16 KB of stack for the mbedtls handshake.
+//
+// Streams the image manually with the EXACT client configuration proven by
+// gh_check_task (which reliably completes GitHub GETs in ~5 s), rather than
+// httpUpdate.update() — the latter was observed to hang silently for 90+ s
+// against the same host (no error return, no reboot). Every exit reboots:
+// success boots the new image; any failure reboots to clear a half-written
+// Update state (arduino-esp32 #8393) and bring the radio/BLE back clean.
 static void ota_run_task(void*) {
     bool is_http  = (strncmp(s_pending_url, "http://", 7) == 0);
     bool is_https = (strncmp(s_pending_url, "https://", 8) == 0);
@@ -39,13 +57,12 @@ static void ota_run_task(void*) {
 #endif
     if (!is_http && !is_https) {
         wlogf("[ota-http] ignoring unsupported URL: %s\n", s_pending_url);
-        vTaskDelete(NULL);
-        return;   // not reached; silences no-return analysis
+        ESP.restart();   // s_running was set by the tick — reboot clears it
+        return;
     }
 
     wlogf("[ota-http] starting %s OTA from %s\n",
           is_https ? "HTTPS" : "HTTP", s_pending_url);
-    ui_ota_start();   // arg-less; no percent API exists, so no progress hook
 
     // WiFi and BLE share the S3's single 2.4GHz radio: BLE must be fully
     // deinitialized (not merely paused) for the transfer to survive. This also
@@ -53,58 +70,137 @@ static void ota_run_task(void*) {
     scale_radio_release();
     WiFi.setSleep(false);
 
-    httpUpdate.rebootOnUpdate(true);    // success path reboots into new image
+    s_ota_pct = 0;
 
-    t_httpUpdate_return ret;
+    // The client objects must outlive the whole transfer — HTTPClient::begin()
+    // stores a reference to them — so they live at task scope, not inside the
+    // scheme branch below (secure only exists when the TLS stack is compiled in).
+#if defined(FEATURE_GH_OTA)
+    WiFiClientSecure secure;
+#endif
+    WiFiClient plain;
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub -> CDN 302
+    http.setConnectTimeout(20000);   // ms
+    http.setTimeout(20000);          // ms
+
+    // Shared cleanup+reboot for every failure exit. ESP.restart() does not
+    // return; the `return;` after each call documents the control flow.
+    auto fail = [&](const char* why) {
+        wlogf("[ota-http] FAILED: %s\n", why);
+        Update.abort();
+        http.end();
+        ESP.restart();
+    };
+
+    bool begun;
 #if defined(FEATURE_GH_OTA)
     if (is_https) {
-        // GitHub 302-redirects release assets to its CDN, so follow redirects.
         // setInsecure(): no cert validation. Accepted tradeoff — the dual-
         // partition scheme rolls back on a corrupt/incomplete image, so a MITM
         // can at worst cause a rejected update, not a persistently bad boot.
-        WiFiClientSecure secure;
         secure.setInsecure();
-        secure.setTimeout(30);          // seconds
-        httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        ret = httpUpdate.update(secure, s_pending_url);
+        secure.setHandshakeTimeout(30);   // seconds — TLS over a laggy coex link
+        begun = http.begin(secure, s_pending_url);
     } else
 #endif
     {
-        WiFiClient client;
-        // Generous socket timeout so a slow build-PC response doesn't abort the
-        // pull; the task WDT is not armed on the loop task, so this is WDT-safe.
-        client.setTimeout(30);          // seconds
-        ret = httpUpdate.update(client, s_pending_url);
+        begun = http.begin(plain, s_pending_url);
+    }
+    if (!begun) { fail("http.begin() failed"); return; }
+
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        char b[48];
+        snprintf(b, sizeof(b), "HTTP GET returned %d", code);
+        fail(b);
+        return;
     }
 
-    // Only reached on failure/no-update — a successful update reboots inside
-    // update(). Reboot unconditionally so any wedged Update state machine is
-    // cleared (arduino-esp32 #8393) and BLE/radio come back clean next boot.
-    switch (ret) {
-        case HTTP_UPDATE_FAILED:
-            wlogf("[ota-http] failed (%d): %s\n",
-                  httpUpdate.getLastError(),
-                  httpUpdate.getLastErrorString().c_str());
-            break;
-        case HTTP_UPDATE_NO_UPDATES:
-            wlogf("[ota-http] server reported no update\n");
-            break;
-        case HTTP_UPDATE_OK:
-            // Unreachable with rebootOnUpdate(true), but log for completeness.
-            wlogf("[ota-http] update ok — rebooting\n");
-            break;
+    int len = http.getSize();   // GitHub CDN sends Content-Length
+    if (len <= 0) { fail("no/zero Content-Length"); return; }
+
+    if (!Update.begin((size_t)len)) {
+        char b[80];
+        snprintf(b, sizeof(b), "Update.begin (err %u): %s",
+                 (unsigned)Update.getError(), Update.errorString());
+        fail(b);
+        return;
     }
+
+    // Stream in ~4 KB chunks. buf is static (not on the stack): the 16 KB stack
+    // is sized for the mbedtls handshake alone, and a 4 KB stack frame would eat
+    // into that headroom on the very path this rewrite exists to make robust.
+    // Safe because this task is single-shot (s_running-guarded, reboot-ended).
+    static uint8_t buf[4096];
+    WiFiClient*    stream    = http.getStreamPtr();
+    int            remaining = len;
+    uint32_t       last_data = millis();
+
+    while (remaining > 0) {
+        size_t avail = stream->available();
+        if (avail) {
+            size_t toread = avail;
+            if (toread > sizeof(buf))    toread = sizeof(buf);
+            if ((int)toread > remaining) toread = (size_t)remaining;
+            int r = stream->readBytes(buf, toread);
+            if (r <= 0) { fail("stream read error"); return; }
+            if (Update.write(buf, (size_t)r) != (size_t)r) {
+                char b[80];
+                snprintf(b, sizeof(b), "Update.write (err %u): %s",
+                         (unsigned)Update.getError(), Update.errorString());
+                fail(b);
+                return;
+            }
+            remaining -= r;
+            s_ota_pct  = (uint8_t)(((int64_t)(len - remaining) * 100) / len);
+            last_data  = millis();
+        } else if (millis() - last_data > 20000UL) {
+            fail("stalled — no data for 20 s");
+            return;
+        } else {
+            delay(1);   // yield to the scheduler (feeds the idle-task WDT)
+        }
+    }
+
+    if (!Update.end(true) || !Update.isFinished()) {
+        char b[80];
+        snprintf(b, sizeof(b), "Update.end (err %u): %s",
+                 (unsigned)Update.getError(), Update.errorString());
+        fail(b);
+        return;
+    }
+
+    s_ota_pct = 100;
+    wlogf("[ota-http] complete (%d bytes) — rebooting into new image\n", len);
     ESP.restart();
 }
 
 void ota_http_tick() {
     if (!s_pending) return;
     s_pending = false;
+
+    // Re-entrancy guard: a transfer already owns the radio and the Update state
+    // machine. Refuse duplicates with a single log line (s_pending was just
+    // cleared, so a stray repeated tap logs at most once per request — no spam).
+    if (s_running) {
+        wlogf("[ota-http] transfer already running — ignoring request\n");
+        return;
+    }
+    s_running = true;
+
+    // Drive the OTA progress screen from loop() context. LVGL is not thread-safe
+    // and the transfer task makes NO LVGL calls, so this is the one place the
+    // OTA screen is switched on; the task only publishes s_ota_pct for the UI.
+    ui_ota_start();
+
     // 16 KB stack: mbedtls handshake headroom on the TLS path (plain HTTP needs
     // far less, but one size keeps it simple). Every outcome ends in a reboot,
     // so the task never needs to be tracked or joined.
     if (xTaskCreate(ota_run_task, "ota_run", 16384, NULL, 2, NULL) != pdPASS) {
-        wlogf("[ota-http] failed to spawn transfer task\n");
+        wlogf("[ota-http] failed to spawn transfer task — rebooting\n");
+        ESP.restart();   // clean recovery (matches the every-outcome-reboots rule)
     }
 }
 
