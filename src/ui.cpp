@@ -7,6 +7,8 @@
 #include "wifi_ap.h"
 #include "gicar.h"
 #include "mqtt.h"
+#include "ota_http.h"
+#include "version.h"
 #include "wlog.h"
 #include <time.h>
 
@@ -23,7 +25,7 @@ extern uint32_t wifi_retry_count();
 // Defined in src/fonts/lv_font_lm72_bold.c.
 LV_FONT_DECLARE(lv_font_lm72_bold);
 
-#define FW_VERSION "v0.24"  // bump on every deployed update (user convention)
+// FW_VERSION now lives in include/version.h (shared with the OTA module).
 
 // ─── Forward declarations ──────────────────────────────────────────────────────
 static void ui_show_main();
@@ -50,8 +52,11 @@ enum SettingsItem {
     SI_STEAM,        // 6  ON / OFF
     SI_WIFI,         // 7  navigate → WiFi status screen
     SI_CLEAN_INT,    // 8  shots between cleaning cycles, 10..100 step 5
-    SI_BACK,         // 9  action — save + return to main
-    SI_COUNT         // 10
+#if defined(FEATURE_GH_OTA)
+    SI_FW_UPDATE,    //    action — GitHub firmware check / install
+#endif
+    SI_BACK,         //    action — save + return to main
+    SI_COUNT
 };
 // Clean cycle moved to a hold-to-start button on the Main screen (v0.16);
 // coffee temp moved to the main-screen edge adjuster (v0.20).
@@ -66,6 +71,9 @@ static const char *item_names[SI_COUNT] = {
     "Steam",
     "WiFi",
     "Clean interval",
+#if defined(FEATURE_GH_OTA)
+    "Firmware update",
+#endif
     "Back"
 };
 
@@ -770,6 +778,20 @@ static const char* get_item_val(int i) {
             snprintf(buf, sizeof(buf), "%.1f g", settings.prestop_offset_g); break;
         case SI_CLEAN_INT:
             snprintf(buf, sizeof(buf), "%u shots", settings.clean_interval); break;
+#if defined(FEATURE_GH_OTA)
+        case SI_FW_UPDATE:
+            switch (ota_gh_state()) {
+                case GH_CHECKING:     snprintf(buf, sizeof(buf), "Checking..."); break;
+                case GH_UP_TO_DATE:   snprintf(buf, sizeof(buf), "Up to date");  break;
+                case GH_UPDATE_AVAIL:
+                    snprintf(buf, sizeof(buf), "%s - install", ota_gh_remote_version());
+                    break;
+                case GH_CHECK_FAILED: snprintf(buf, sizeof(buf), "Check failed"); break;
+                case GH_IDLE:
+                default:              snprintf(buf, sizeof(buf), "Check"); break;
+            }
+            break;
+#endif
         case SI_BACK:
             buf[0] = '\0'; break;
         default:
@@ -797,7 +819,11 @@ static void settings_draw() {
             sel ? lv_color_white() : lv_color_make(0x90, 0x90, 0x90), 0);
 
         char vbuf[32];
-        bool is_value_item = (i != SI_WIFI && i != SI_BACK && i != SI_SCHEDULE);
+        bool is_value_item = (i != SI_WIFI && i != SI_BACK && i != SI_SCHEDULE
+#if defined(FEATURE_GH_OTA)
+                              && i != SI_FW_UPDATE
+#endif
+                              );
         if (ed && is_value_item) {
             snprintf(vbuf, sizeof(vbuf), "< %s >", get_item_val(i));
             lv_obj_set_style_text_color(settings_val_lbl[i], lv_color_make(0xF0, 0xA8, 0x30), 0);
@@ -910,6 +936,17 @@ static void settings_scroll() {
     lv_obj_scroll_to_view(settings_rows[settings_sel], LV_ANIM_OFF);
 }
 
+#if defined(FEATURE_GH_OTA)
+// Firmware-update row action: kick off a GitHub check, or (if a newer release
+// was already found) start the install. The install path hands off to the OTA
+// screen via ota_http_tick().
+static void settings_fw_update_activate() {
+    if (ota_gh_state() == GH_UPDATE_AVAIL) ota_gh_install();
+    else                                   ota_gh_check();
+    settings_draw();   // reflect "Checking..." immediately
+}
+#endif
+
 static void settings_select() {
     switch (settings_sel) {
         case SI_SCHEDULE:
@@ -918,6 +955,11 @@ static void settings_select() {
         case SI_WIFI:
             ui_show_wifi();
             return;
+#if defined(FEATURE_GH_OTA)
+        case SI_FW_UPDATE:
+            settings_fw_update_activate();
+            return;
+#endif
         case SI_BACK:
             settings_save();
             settings_sel  = 0;
@@ -999,6 +1041,9 @@ static void settings_nav_ret_cb(lv_event_t *e) {
     switch (settings_sel) {
         case SI_WIFI:     ui_show_wifi();  return;
         case SI_SCHEDULE: ui_show_sched(); return;
+#if defined(FEATURE_GH_OTA)
+        case SI_FW_UPDATE: settings_fw_update_activate(); return;
+#endif
         case SI_BACK:
             settings_save();
             settings_sel  = 0;
@@ -1451,6 +1496,13 @@ static void settings_row_click_cb(lv_event_t *e) {
         ui_show_sched();
         return;
     }
+#if defined(FEATURE_GH_OTA)
+    if (idx == SI_FW_UPDATE) {
+        settings_sel = idx;
+        settings_fw_update_activate();
+        return;
+    }
+#endif
     if (idx == SI_BACK) {
         settings_save();
         settings_sel  = 0;
@@ -1702,6 +1754,19 @@ void ui_tick() {
             case UI_WIFI:     ui_wifi_update();  break;
             case UI_SCHED:    ui_sched_update(); break;
             case UI_SETTINGS:
+#if defined(FEATURE_GH_OTA)
+                // The firmware-update row's value text changes when the async
+                // GitHub check task finishes; redraw the list on any transition.
+                {
+                    static GhOtaState last_gh = GH_IDLE;
+                    GhOtaState now_gh = ota_gh_state();
+                    if (now_gh != last_gh) {
+                        last_gh = now_gh;
+                        settings_draw();
+                    }
+                }
+#endif
+                break;
             case UI_WIFI_AP:  break;
         }
     }

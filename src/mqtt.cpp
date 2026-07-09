@@ -5,7 +5,7 @@
 #include "gicar.h"
 #include "wlog.h"
 #include "ota_http.h"
-#include "secrets.h"
+#include "mqtt_config.h"
 #include <PubSubClient.h>
 #include <WiFiClient.h>
 #include <WiFi.h>
@@ -241,8 +241,8 @@ static bool do_connect() {
     snprintf(client_id, sizeof(client_id), "lm_mini_%04X",
              (unsigned)(ESP.getEfuseMac() & 0xFFFF));
 
-    bool ok = (strlen(MQTT_USER) > 0)
-        ? s_client.connect(client_id, MQTT_USER, MQTT_PASS,
+    bool ok = (strlen(mqtt_config_user()) > 0)
+        ? s_client.connect(client_id, mqtt_config_user(), mqtt_config_pass(),
                            MQTT_AVAIL, 0, true, "offline")
         : s_client.connect(client_id, nullptr, nullptr,
                            MQTT_AVAIL, 0, true, "offline");
@@ -266,12 +266,19 @@ static bool do_connect() {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 void mqtt_init() {
-    s_client.setServer(MQTT_HOST, MQTT_PORT);
+    // NVS-first broker config (survives CI-built OTA updates with blank secrets).
+    mqtt_config_init();
+    if (!mqtt_config_enabled()) return;   // no broker — mqtt_tick() no-ops
+    s_client.setServer(mqtt_config_host(), mqtt_config_port());
     s_client.setCallback(on_msg);
     s_client.setBufferSize(512);
 }
 
 void mqtt_tick() {
+    // No broker configured (e.g. a CI-stubbed build on a fresh device): stay
+    // fully idle rather than spin trying to connect to an empty host.
+    if (!mqtt_config_enabled()) return;
+
     // If WiFi dropped, force-disconnect MQTT so the stale TCP socket is cleared
     // and the reconnect logic below can re-establish cleanly.
     if (WiFi.status() != WL_CONNECTED) {

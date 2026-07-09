@@ -1,0 +1,103 @@
+name: Release firmware
+
+# Fires on tags like v0.26. Builds the S3 env, packages firmware.bin +
+# version.json, and publishes a GitHub Release with generated notes.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # tools/gen_build_info.py (PlatformIO pre-build hook) runs
+          # `git rev-parse --short HEAD` and `git diff --quiet` to embed
+          # FW_GIT_HASH into the build; `gh release create --generate-notes`
+          # also needs commit history since the previous tag to summarize.
+          # A shallow (default) checkout would starve the latter.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-platformio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-platformio-
+
+      - name: Generate include/secrets.h for CI build
+        # include/secrets.h is gitignored (never committed). The firmware
+        # only needs the defines to exist to compile; MQTT_HOST MUST stay ""
+        # here because mqtt_config_init() (src/mqtt_config.cpp) seeds NVS from
+        # the compiled-in MQTT_HOST on first boot whenever it is non-empty --
+        # a CI build must never plant a bogus broker address into a real
+        # device's NVS. Keys mirror include/secrets.h.example exactly.
+        run: |
+          cat > include/secrets.h << 'EOF'
+          #pragma once
+
+          // -- WiFi (fallback when no NVS-stored credentials) --
+          #define WIFI_SSID       ""
+          #define WIFI_PASSWORD   ""
+
+          // -- MQTT broker --
+          // MQTT_HOST intentionally empty: mqtt_config_init() only seeds NVS
+          // from this value when it is non-empty. Must stay "" for CI builds.
+          #define MQTT_HOST       ""
+          #define MQTT_PORT       1883
+          #define MQTT_USER       ""
+          #define MQTT_PASS       ""
+
+          // -- Arduino OTA (empty string disables the OTA password) --
+          #define OTA_PASSWORD    ""
+          EOF
+
+      - name: Build firmware (lm_controller_s3)
+        run: pio run -e lm_controller_s3
+
+      - name: Generate version.json
+        run: |
+          python - << 'EOF'
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          short_sha = subprocess.check_output(
+              ["git", "rev-parse", "--short", "HEAD"], text=True
+          ).strip()
+          data = {
+              "version": tag,
+              "build": short_sha,
+              "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open("version.json", "w") as f:
+              json.dump(data, f, indent=2)
+          print(json.dumps(data, indent=2))
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            ".pio/build/lm_controller_s3/firmware.bin" \
+            "version.json" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

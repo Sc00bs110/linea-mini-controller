@@ -171,6 +171,10 @@ static void wifi_tick() {
     wifi_begin();
 }
 
+// The GitHub OTA install path runs a TLS httpUpdate on the loop task; the
+// default 8 KB stack is too tight for an mbedtls handshake.
+SET_LOOP_TASK_STACK_SIZE(20 * 1024);
+
 void setup() {
     Serial.begin(115200);
     // Never block on USB CDC writes: with no host draining the port, the
