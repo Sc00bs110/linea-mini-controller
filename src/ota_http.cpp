@@ -10,6 +10,7 @@
 
 #if defined(FEATURE_GH_OTA)
 #include "version.h"          // FW_VERSION — the local version we compare against
+#include "machine.h"          // machine.brew_active — brew guard on check/install
 #include <WiFiClientSecure.h> // TLS client for the GitHub release fetch/install
 #endif
 
@@ -238,6 +239,22 @@ static void gh_check_task(void*) {
     s_gh_state = GH_CHECKING;
     s_gh_remote_ver[0] = '\0';
 
+    // Free the BLE radio before the TLS handshake. The precompiled core is built
+    // with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y, so mbedtls allocates its ~50KB
+    // handshake buffers from INTERNAL RAM only. With the scale connected, internal
+    // free is ~45KB and every handshake fails with "SSL - Memory allocation
+    // failed". Suspending BLE (deinit) frees the headroom — the install path
+    // already does this, which is why it never hit the error. Restored on all
+    // exits below via scale_radio_resume() (this task does not reboot).
+    scale_radio_suspend();
+
+    // Diag AFTER the suspend so the numbers show the freed internal headroom.
+    wlogf("[ota-gh] heap free=%u largest=%u internal=%u rssi=%d\n",
+          (unsigned)esp_get_free_heap_size(),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+          (int)WiFi.RSSI());
+
     WiFiClientSecure secure;
     secure.setInsecure();   // see the tradeoff note on the install path above
     secure.setHandshakeTimeout(30);   // seconds — TLS over a laggy coex link
@@ -245,13 +262,6 @@ static void gh_check_task(void*) {
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub -> CDN 302
     http.setConnectTimeout(20000);   // ms
     http.setTimeout(20000);   // ms
-
-    // TEMP diag while the check path is being field-proven.
-    wlogf("[ota-gh] heap free=%u largest=%u internal=%u rssi=%d\n",
-          (unsigned)esp_get_free_heap_size(),
-          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-          (int)WiFi.RSSI());
 
     GhOtaState result = GH_CHECK_FAILED;
     if (http.begin(secure, GH_LATEST_BASE "version.json")) {
@@ -292,11 +302,26 @@ static void gh_check_task(void*) {
         wlogf("[ota-gh] connection to GitHub failed\n");
     }
 
+    // Restore BLE before publishing + self-deleting. Single exit point (one
+    // `result`, one vTaskDelete) means this runs on ALL outcomes — success, HTTP
+    // failure, and parse failure alike. The task does not reboot, so the radio
+    // must be handed back explicitly (unlike the install path).
+    scale_radio_resume();
+
     s_gh_state = result;   // publish last (acts as the release barrier)
     vTaskDelete(NULL);
 }
 
 void ota_gh_check() {
+    // Refuse mid-shot: the check suspends BLE for several seconds, which would
+    // break brew-by-weight. Set GH_CHECK_FAILED so the settings row shows "Check
+    // failed" rather than hanging in "Checking...". (Start-of-call guard only — a
+    // brew that begins during an in-flight check is an accepted, brief race.)
+    if (machine.brew_active) {
+        wlogf("[ota-gh] check refused — brew active\n");
+        s_gh_state = GH_CHECK_FAILED;
+        return;
+    }
     if (s_gh_state == GH_CHECKING) return;   // one check at a time
     // TLS handshake wants generous stack headroom (loop's ota_task uses 8192).
     if (xTaskCreate(gh_check_task, "gh_check", 12288, NULL, 2, NULL) != pdPASS) {
@@ -306,6 +331,12 @@ void ota_gh_check() {
 }
 
 void ota_gh_install() {
+    // Refuse mid-shot: the install releases BLE and reboots, which would abort a
+    // brew-by-weight shot. Start-of-call guard only (see ota_gh_check()).
+    if (machine.brew_active) {
+        wlogf("[ota-gh] install refused — brew active\n");
+        return;
+    }
     // Reuse the queued-URL machinery: ota_http_tick() picks up the https:// URL,
     // switches on the OTA screen, releases the radio, and runs the TLS update.
     ota_http_request(GH_LATEST_BASE "firmware.bin");

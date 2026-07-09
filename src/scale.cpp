@@ -166,6 +166,10 @@ class ScaleClientCb : public NimBLEClientCallbacks {
 
 // ─── BLE scan callback ────────────────────────────────────────────────────────
 
+// File-static single instance (not new'd per boot/resume). setScanCallbacks() is
+// registered with deleteCallbacks=false so NimBLEDevice::deinit() never tries to
+// free this static — a resume re-registers the same instance. A new'd callback
+// would leak one object per suspend/resume cycle.
 class ScaleScanCb : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice* dev) override {
         if (s_found) return;
@@ -190,17 +194,15 @@ class ScaleScanCb : public NimBLEScanCallbacks {
     }
 };
 
-// ─── BLE task ─────────────────────────────────────────────────────────────────
+static ScaleScanCb s_scan_cb;
 
-static void scale_ble_task(void*) {
-    // Wait for WiFi before scanning — shared 2.4GHz radio; BLE scanning during
-    // association prevents WiFi from completing in the machine's noisy environment.
-    // Skip when WiFi is intentionally disabled (WIFI_ENABLED 0).
-    if (WiFi.getMode() != WIFI_OFF) {
-        while (WiFi.status() != WL_CONNECTED) vTaskDelay(pdMS_TO_TICKS(500));
-        vTaskDelay(pdMS_TO_TICKS(2000));  // brief settle after connect
-    }
+// ─── BLE setup helper ─────────────────────────────────────────────────────────
 
+// One-time-per-radio-lifecycle BLE bring-up: init the stack and configure the
+// scan. Factored out of scale_ble_task() so scale_radio_resume() can bring BLE
+// back with the IDENTICAL configuration after a suspend/deinit. Does NOT wait
+// for WiFi (the caller owns that) and does NOT start a scan (the task loop does).
+static void scale_ble_setup() {
     NimBLEDevice::init("");
     NimBLEDevice::setPower(ESP_PWR_LVL_P3);
 
@@ -214,7 +216,8 @@ static void scale_ble_task(void*) {
     // (interval/window was 120/60 = 50%; now 320/16 = 5%) so the radio
     // spends far less time actively scanning per unit time.
     NimBLEScan* pScan = NimBLEDevice::getScan();
-    pScan->setScanCallbacks(new ScaleScanCb(), false);
+    // deleteCallbacks=false: s_scan_cb is a file-static, never freed by deinit().
+    pScan->setScanCallbacks(&s_scan_cb, false);
     // Active scan is REQUIRED: the Bookoo Themis advertises its name only in
     // the scan response, which passive scanning never requests — with
     // setActiveScan(false) the scale is invisible to the name filter
@@ -231,6 +234,20 @@ static void scale_ble_task(void*) {
     // during a brew, so aggressive scanning costs nothing that matters.
     pScan->setInterval(120);
     pScan->setWindow(60);
+}
+
+// ─── BLE task ─────────────────────────────────────────────────────────────────
+
+static void scale_ble_task(void*) {
+    // Wait for WiFi before scanning — shared 2.4GHz radio; BLE scanning during
+    // association prevents WiFi from completing in the machine's noisy environment.
+    // Skip when WiFi is intentionally disabled (WIFI_ENABLED 0).
+    if (WiFi.getMode() != WIFI_OFF) {
+        while (WiFi.status() != WL_CONNECTED) vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(2000));  // brief settle after connect
+    }
+
+    scale_ble_setup();
 
     for (;;) {
         // Don't scan during an active brew — BLE scan disrupts the shared WiFi
@@ -244,6 +261,12 @@ static void scale_ble_task(void*) {
             while (machine.brew_active || s_ota_hold) vTaskDelay(pdMS_TO_TICKS(500));
             s_ble_parked = false;
         }
+
+        // Fetch the scan handle AFTER the park block: a scale_radio_suspend()/
+        // resume() cycle deinit(true)s and re-inits NimBLE while we're parked,
+        // invalidating any handle held across the park. getScan() returns the
+        // current (post-resume) singleton, so this is always live here.
+        NimBLEScan* pScan = NimBLEDevice::getScan();
 
         s_found       = false;
         s_target_model = SCALE_NONE;
@@ -393,8 +416,8 @@ void scale_set_ota_hold(bool hold) {
     }
 }
 
-void scale_radio_release() {
-    wlogf("[scale] radio release for OTA — parking task, deinit BLE\n");
+void scale_radio_suspend() {
+    wlogf("[scale] radio suspend — parking task, deinit BLE\n");
 
     // 1) Raise the hold so the scale task exits any scan/connect loop and heads
     //    for its park gate; 2) kill any in-flight scan immediately.
@@ -413,10 +436,32 @@ void scale_radio_release() {
 
     // 4) Fully free the radio for WiFi. Pausing the scan is not enough on the
     //    S3's single shared 2.4GHz radio; deinit(true) also clears NimBLE state
-    //    so WiFi.setSleep(false) becomes legal. A reboot (every OTA path) brings
-    //    BLE back up from scratch — no resume needed.
+    //    so WiFi.setSleep(false) becomes legal. deinit STRICTLY AFTER the task
+    //    parked (step 3) — no NimBLE call is in flight, so this is race-free.
     if (NimBLEDevice::isInitialized()) {
         NimBLEDevice::deinit(true);
     }
     wlogf("[scale] BLE deinitialized (parked=%d)\n", s_ble_parked ? 1 : 0);
+}
+
+void scale_radio_resume() {
+    wlogf("[scale] radio resume — re-init BLE, unpark task\n");
+
+    // Re-init the stack with the identical scan configuration BEFORE clearing the
+    // hold. The parked task spins in its gate on s_ota_hold and makes NO NimBLE
+    // calls until the hold drops; re-initializing first guarantees the task never
+    // touches a torn-down stack when it unparks (race-free counterpart to the
+    // deinit-after-park ordering in scale_radio_suspend()).
+    if (!NimBLEDevice::isInitialized()) {
+        scale_ble_setup();
+    }
+
+    // Drop the hold last: the task now leaves its gate, re-fetches the fresh scan
+    // handle, and resumes scanning — reconnecting to the scale naturally.
+    s_ota_hold = false;
+}
+
+// Reboot-ending OTA paths (install / ArduinoOTA) release and never resume.
+void scale_radio_release() {
+    scale_radio_suspend();
 }
