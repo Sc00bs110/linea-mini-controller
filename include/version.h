@@ -5,4 +5,4 @@
 // auto-generated per build. Lives in its own header so both ui.cpp (settings +
 // main-screen label) and the OTA module (GitHub release comparison) share one
 // definition. Format is "vMAJ.MIN" — the OTA check parses it numerically.
-#define FW_VERSION "v0.27"  // bump on every deployed update (user convention)
+#define FW_VERSION "v0.28"  // bump on every deployed update (user convention)
