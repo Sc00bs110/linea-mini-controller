@@ -25,10 +25,11 @@ void ota_http_request(const char* url) {
     s_pending = true;
 }
 
-void ota_http_tick() {
-    if (!s_pending) return;
-    s_pending = false;
-
+// Runs the actual transfer. Lives in its own dedicated task (not loop()):
+// the TLS install path needs ~16 KB of stack for the mbedtls handshake, and
+// fattening the loop task's stack for a once-per-update event would cost that
+// internal RAM permanently.
+static void ota_run_task(void*) {
     bool is_http  = (strncmp(s_pending_url, "http://", 7) == 0);
     bool is_https = (strncmp(s_pending_url, "https://", 8) == 0);
 
@@ -38,7 +39,8 @@ void ota_http_tick() {
 #endif
     if (!is_http && !is_https) {
         wlogf("[ota-http] ignoring unsupported URL: %s\n", s_pending_url);
-        return;
+        vTaskDelete(NULL);
+        return;   // not reached; silences no-return analysis
     }
 
     wlogf("[ota-http] starting %s OTA from %s\n",
@@ -95,6 +97,17 @@ void ota_http_tick() {
     ESP.restart();
 }
 
+void ota_http_tick() {
+    if (!s_pending) return;
+    s_pending = false;
+    // 16 KB stack: mbedtls handshake headroom on the TLS path (plain HTTP needs
+    // far less, but one size keeps it simple). Every outcome ends in a reboot,
+    // so the task never needs to be tracked or joined.
+    if (xTaskCreate(ota_run_task, "ota_run", 16384, NULL, 2, NULL) != pdPASS) {
+        wlogf("[ota-http] failed to spawn transfer task\n");
+    }
+}
+
 #if defined(FEATURE_GH_OTA)
 // ─── GitHub release check + install ──────────────────────────────────────────
 
@@ -131,13 +144,27 @@ static void gh_check_task(void*) {
 
     WiFiClientSecure secure;
     secure.setInsecure();   // see the tradeoff note on the install path above
+    secure.setHandshakeTimeout(30);   // seconds — TLS over a laggy coex link
     HTTPClient http;
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub -> CDN 302
-    http.setTimeout(15000);   // ms
+    http.setConnectTimeout(20000);   // ms
+    http.setTimeout(20000);   // ms
+
+    // TEMP diag while the check path is being field-proven.
+    wlogf("[ota-gh] heap free=%u largest=%u internal=%u rssi=%d\n",
+          (unsigned)esp_get_free_heap_size(),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+          (int)WiFi.RSSI());
 
     GhOtaState result = GH_CHECK_FAILED;
     if (http.begin(secure, GH_LATEST_BASE "version.json")) {
         int code = http.GET();
+        if (code < 0) {
+            char ebuf[128] = {};
+            secure.lastError(ebuf, sizeof(ebuf));
+            wlogf("[ota-gh] tls lastError: %s\n", ebuf[0] ? ebuf : "(none)");
+        }
         if (code == HTTP_CODE_OK) {
             String body = http.getString();
             // Minimal JSON scan — no ArduinoJson dependency. Expect

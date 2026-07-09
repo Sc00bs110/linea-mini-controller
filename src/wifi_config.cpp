@@ -16,6 +16,11 @@ void wifi_config_init() {
         prefs.getString("pass", _pass, sizeof(_pass));
     }
     prefs.end();
+    // Seed NVS once from a locally-built secrets.h so CI-built OTA images
+    // (blank WIFI_SSID stub) inherit working credentials — same rule as
+    // mqtt_config. A CI build never seeds because its compiled SSID is empty.
+    if (!_has_nvs && strlen(WIFI_SSID) > 0)
+        wifi_config_save(WIFI_SSID, WIFI_PASSWORD);
 }
 
 bool wifi_config_has_credentials() { return _has_nvs; }

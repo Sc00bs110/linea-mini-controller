@@ -9,8 +9,22 @@
 #define LV_COLOR_DEPTH 16       // DFR1092 (ILI9488 via LovyanGFX) uses RGB565
 
 // --- Memory ---
+// On PSRAM boards (S3), LVGL's heap lives in PSRAM (ps_malloc): the 48 KB
+// static internal-RAM pool starved mbedtls, whose TLS buffers MUST be internal
+// — the GitHub OTA check failed with "SSL - Memory allocation failed" at
+// ~32 KB internal free (field-debugged 2026-07-09). Widget allocs from PSRAM
+// are fine perf-wise on the S3's octal PSRAM; the 10-row draw buffer stays
+// internal in display.cpp. The C6 (no PSRAM) keeps the static pool.
+#ifdef BOARD_HAS_PSRAM
+#define LV_MEM_CUSTOM 1
+#define LV_MEM_CUSTOM_INCLUDE "esp32-hal-psram.h"
+#define LV_MEM_CUSTOM_ALLOC   ps_malloc
+#define LV_MEM_CUSTOM_FREE    free
+#define LV_MEM_CUSTOM_REALLOC ps_realloc
+#else
 #define LV_MEM_CUSTOM 0
 #define LV_MEM_SIZE   (48U * 1024U)   // 48 KB heap for LVGL
+#endif
 
 // --- HAL tick ---
 #define LV_TICK_CUSTOM 1
