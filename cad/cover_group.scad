@@ -9,16 +9,19 @@
 //
 // Stock-part dimensions measured with calipers off the real C.1.743
 // (2026-07-08): 300 x 130 x 3 mm flat plate, no flanges, 4 mm corner radius,
-// four 5 mm round mounting holes 18 mm in from front/back edges and 10 mm in
-// from left/right edges, no other cutouts.
+// four 5 mm round mounting holes 18 mm in from front/back edges; left/right
+// inset revised to 9.5 mm (2026-07-09: +0.5 mm gap each side vs the 9 mm
+// second fit test).
 //
-// Display pod: right-hand side, screen at 70 deg from horizontal, yawed
-// 10 deg INWARD (face turns toward the machine centre/operator) to keep the
-// cup-warming tray accessible. The pod is an OPEN-BACKED frame housing
-// supported by triangular side cheeks: the DFR1092 slides in from the back
-// onto M2 bosses behind the face skin (straight-on screwdriver access), and
-// its harness drops through a slot in the panel below the opening. Corners
-// of the housing outline carry a 2 mm fillet.
+// Display pod (v2, 2026-07-09): right-hand side, screen at 20 deg from
+// horizontal, facing the front directly (no yaw), 10 mm wider than the
+// module on EACH side for cable slack. The pod is SEALED — no external
+// hatch. Its only opening is downward: an installation aperture in the
+// panel underneath, through which the DFR1092 (screws onto M2 bosses
+// behind the face skin) and the FireBeetle (screws onto M2 bosses on the
+// inside of the pod's rear wall — "the back panel") are fitted. A snap-in
+// cover closes the aperture from below, with an open cable notch on its
+// rear edge for the harness coming up from inside the machine.
 //
 // Datum: X=0,Y=0 = FRONT-LEFT corner of the panel top face. X right (300),
 // Y back (130), Z up. "Front" = barista-facing edge.
@@ -30,14 +33,12 @@ panel_wid      = 130;
 panel_thick    = 3;
 corner_r       = 4;
 mount_hole_d   = 5.0;
-// 9mm in from left/right edges, 18mm in from front/back (re-measured
-// 2026-07-08 after the first fit test: was 10mm, holes sat 1mm outboard)
-mount_holes    = [ [9,18], [291,18], [9,112], [291,112] ];
+// 9.5mm in from left/right edges, 18mm in from front/back
+mount_holes    = [ [9.5,18], [290.5,18], [9.5,112], [290.5,112] ];
 
 // ── PARAMETERS — display pod ─────────────────────────────────────────────────
-disp_angle     = 70;     // screen tilt from horizontal (deg)
-disp_yaw       = 10;     // inward turn toward the operator (deg)
-pod_center_x   = 225;    // pod centre X (right side, clear of 290mm holes)
+disp_angle     = 20;     // screen tilt from horizontal (deg)
+pod_center_x   = 225;    // pod centre X (right side, clear of the 290.5 holes)
 pod_center_y   = 60;     // pod centre Y
 pod_fillet     = 2;      // fillet on the housing outline corners
 
@@ -54,95 +55,65 @@ disp_margin    = 1.0;    // aperture margin around active area
 
 pod_wall       = 3;      // frame walls + face skin thickness
 pod_clear      = 0.6;    // module fit clearance
+side_extra     = 10;     // extra housing width EACH side for cable slack
 disp_boss_h    = 4;      // module standoff behind the face skin
-wire_space     = 15;     // housing depth behind the module: harness room PLUS
-                         // the FireBeetle stack on the back cover (cover 2 +
-                         // boss 3 + board 1.6 + components ~4 = ~10.6)
-cheek_t        = 3;      // support cheek (gusset) thickness
+wire_space     = 15;     // interior depth behind the module: harness room
+                         // PLUS the FireBeetle stack on the rear wall
+                         // (boss 3 + board 1.6 + components ~4)
+cheek_t        = 3;      // side cheek / rear wall thickness under the slab
 
-// Snap-in back cover (second printed part -- see render_part below)
-cover_t        = 2;      // cover plate thickness
-cover_clear    = 0.3;    // fit clearance inside the cavity
+// Panel aperture under the pod (installation + cabling) and its snap cover
+apt_clear      = 3;      // aperture inset from the pod's under-void footprint
+cover_t        = 2;      // bottom cover plate thickness
+cover_lip      = 4;      // cover overlap beyond the aperture, all round
+cover_clear    = 0.3;    // tab fit clearance against the aperture edges
 tab_w          = 12;     // snap tab width
 tab_t          = 1.6;    // snap tab thickness (flexes to clear the nub)
-tab_reach      = 14;     // how far tabs extend into the cavity
-nub_z          = 9.5;    // nub shoulder height above the cover back face
-nub_proud      = 0.8;    // how far the nub protrudes into the wall slot
-notch_w        = 40;     // harness notch in the cover's bottom edge
-notch_h        = 8;
+nub_proud      = 0.8;    // nub protrusion past the aperture edge
+notch_w        = 25;     // open cable notch, middle of the cover's REAR edge
+notch_d        = 12;     // notch depth into the cover
 
-cable_slot_w   = 40;     // slot through the panel under the open back
-cable_slot_l   = 12;
-
-// ── PARAMETERS — ESP32-S3 (FireBeetle DFR0975) mounting ──────────────────────
-// The board mounts on M2 bosses printed on the INSIDE of the snap-in back
-// cover, long axis horizontal, components facing the display. Grid from
-// DFR0975_2D_CAD.png: 25.4 x 61.47 board, 2.0mm holes at 22 x ~51.4.
-s3_boss_dx     = 51.4;   // hole grid along the board (horizontal in the pod)
-s3_boss_dy     = 22;     // hole grid across the board
-s3_boss_h      = 3;      // standoff height off the cover plate
-s3_boss_hole_d = 1.8;    // self-tap M2
+// ── ESP32-S3 (FireBeetle DFR0975) mounting ───────────────────────────────────
+// No printed bosses: the rear-wall bosses clashed with the display's mounting
+// screws (removed 2026-07-09). Board fixing inside the pod is TBD by the user
+// (adhesive standoffs / velcro / a small carrier). For reference the board is
+// 25.4 x 61.47 with 2.0mm holes on a 22 x ~51.4 grid.
 
 // What to render (edit + F5/F6):
-//   "all"        assembly preview: panel + pod + cover snapped in place
-//   "main"       panel + pod only -> export cover_group.stl
-//   "back_cover" cover alone, flat on the bed -> export cover_group_back.stl
-//   "fit_test"   first fit_test_h mm of the main part only -- quick print to
-//                verify outline/holes/pod footprint against the machine
+//   "all"          assembly preview: panel + pod + bottom cover in place
+//   "main"         panel + pod only -> export cover_group.stl
+//   "bottom_cover" cover alone, flat on the bed -> cover_group_bottom.stl
+//   "fit_test"     first fit_test_h mm of the main part only -- quick print
+//                  to verify outline/holes/pod footprint on the machine
 render_part    = "all";
 fit_test_h     = 1;      // fit-test slice height (mm)
 
 $fn = 48;
 
 // ── Derived ──────────────────────────────────────────────────────────────────
-housing_t  = pod_wall + disp_boss_h + disp_mod_t + wire_space;  // frame depth
-slab_w     = disp_mod_w + 2*(pod_wall + pod_clear);             // outer width
-slab_l     = disp_mod_h + 2*(pod_wall + pod_clear);             // face length
+housing_t  = pod_wall + disp_boss_h + disp_mod_t + wire_space;  // face depth
+slab_w     = disp_mod_w + 2*(pod_wall + pod_clear + side_extra); // outer width
+slab_l     = disp_mod_h + 2*(pod_wall + pod_clear);              // face length
 footY0     = -housing_t * sin(disp_angle);   // front-most footprint extent
-footY1     =  slab_l    * cos(disp_angle);   // cheek depth at panel level
-cheek_h    =  slab_l    * sin(disp_angle);   // cheek height at the back
+footY1     =  slab_l    * cos(disp_angle);   // footprint depth at panel level
+back_h     =  slab_l    * sin(disp_angle);   // slab underside height at rear
 foot_mid   = (footY0 + footY1) / 2;
 
-// ── Panel ────────────────────────────────────────────────────────────────────
+// Panel aperture rectangle. Pod-local X/Y (pod frame origin = resting edge,
+// x centred): inset apt_clear from the under-void's interior footprint
+// (between the cheeks and the front/rear closures).
+apt_w      = slab_w - 2*cheek_t - 2*apt_clear;
+apt_y0l    = apt_clear;                       // pod-local front edge
+apt_l      = (footY1 - cheek_t) - 2*apt_clear;
+// world-frame position of the aperture's front-left corner
+apt_x0     = pod_center_x - apt_w/2;
+apt_y0     = pod_center_y - foot_mid + apt_y0l;
+
+// ── Primitives ───────────────────────────────────────────────────────────────
 module rounded_plate(l, w, t, r) {
     linear_extrude(t)
         offset(r) offset(-r)
             square([l, w]);
-}
-
-// Pod frame: origin = the housing's resting edge on the panel top, centred in
-// X, yawed inward. (Negative Z-rotation turns the face toward the machine
-// centre when the pod is on the right-hand side.)
-module pod_transform() {
-    translate([pod_center_x, pod_center_y, panel_thick])
-        rotate([0, 0, -disp_yaw])
-            translate([0, -foot_mid, 0])
-                children();
-}
-
-module panel() {
-    difference() {
-        rounded_plate(panel_len, panel_wid, panel_thick, corner_r);
-        for (h = mount_holes)
-            translate([h[0], h[1], -1])
-                cylinder(d = mount_hole_d, h = panel_thick + 2);
-        // harness slot just behind the housing's resting edge, under the
-        // open back — same yaw as the pod
-        translate([pod_center_x, pod_center_y, -1])
-            rotate([0, 0, -disp_yaw])
-                translate([-cable_slot_w/2, -foot_mid + 4, 0])
-                    cube([cable_slot_w, cable_slot_l, panel_thick + 2]);
-    }
-}
-
-// ── Display pod ──────────────────────────────────────────────────────────────
-// Housing local frame (before tilt): the screen FACE is the plane
-// z=housing_t; the BACK (z=0) is fully open for installing the module.
-// x centred, y from 0 (front/low edge) to slab_l. tilt() stands it up by
-// disp_angle about the X axis through y=0,z=0.
-module tilt() {
-    rotate([disp_angle, 0, 0])
-        children();
 }
 
 module rounded_rect(w, l, r) {
@@ -151,13 +122,48 @@ module rounded_rect(w, l, r) {
             square([w, l]);
 }
 
+// Pod frame: origin = the slab's resting edge on the panel top, centred in
+// X. No yaw — the face looks straight forward.
+module pod_transform() {
+    translate([pod_center_x, pod_center_y, panel_thick])
+        translate([0, -foot_mid, 0])
+            children();
+}
+
+// Slab local frame (before tilt): the screen FACE is the plane z=housing_t;
+// z=0 is the slab's underside plane (open — the pod's only opening, facing
+// the under-void and the panel aperture). x centred, y from 0 (front/low
+// edge) to slab_l. tilt() leans it back by disp_angle about X through y=0,z=0.
+module tilt() {
+    rotate([disp_angle, 0, 0])
+        children();
+}
+
+// ── Panel ────────────────────────────────────────────────────────────────────
+module panel() {
+    difference() {
+        rounded_plate(panel_len, panel_wid, panel_thick, corner_r);
+        for (h = mount_holes)
+            translate([h[0], h[1], -1])
+                cylinder(d = mount_hole_d, h = panel_thick + 2);
+        // installation aperture under the pod (display + FireBeetle go in
+        // from below; the snap cover closes it from underneath)
+        translate([apt_x0, apt_y0, -1])
+            linear_extrude(panel_thick + 2)
+                offset(2) offset(-2)
+                    square([apt_w, apt_l]);
+    }
+}
+
+// ── Display pod ──────────────────────────────────────────────────────────────
 module display_pod() {
-    // frame housing: rounded outline, open back, face skin with aperture
+    // tilted slab: rounded outline, face skin with aperture, underside open
     tilt() {
         difference() {
             linear_extrude(housing_t)
                 rounded_rect(slab_w, slab_l, pod_fillet);
-            // interior cavity: open at the back (z<0), stops at the face skin
+            // interior cavity: open at the underside (z<0), stops at the
+            // face skin
             translate([-slab_w/2 + pod_wall, pod_wall, -1])
                 cube([slab_w - 2*pod_wall,
                       slab_l - 2*pod_wall,
@@ -169,16 +175,9 @@ module display_pod() {
                 cube([disp_view_w + 2*disp_margin,
                       disp_view_h + 2*disp_margin,
                       pod_wall + 2]);
-            // snap slots through both side walls for the back cover's tabs
-            // (nub shoulder at z_t=nub_z; 0.5 engagement clearance)
-            for (sx = [-1, 1])
-                translate([sx > 0 ? slab_w/2 - pod_wall - 0.2 : -slab_w/2 - 1,
-                           slab_l/2 - (tab_w + 4)/2,
-                           nub_z + 0.5])
-                    cube([pod_wall + 1.2, tab_w + 4, 3.5]);
         }
-        // M2 bosses hanging from the back of the face skin; the module
-        // slides in through the open back and screws onto these
+        // M2 bosses hanging from the back of the face skin — the DFR1092
+        // comes up through the panel aperture and screws onto these
         for (dx = [-disp_hole_dx/2, disp_hole_dx/2],
              dy = [-disp_hole_dy/2, disp_hole_dy/2])
             translate([dx, slab_l/2 + dy, housing_t - pod_wall - disp_boss_h])
@@ -187,20 +186,25 @@ module display_pod() {
                     translate([0, 0, -1])
                         cylinder(d = disp_hole_d, h = disp_boss_h + 2);
                 }
+        // (FireBeetle bosses removed 2026-07-09: they would have clashed with
+        // the display's mounting screws — the board's fixing is TBD by the
+        // user; the rear wall is left plain.)
     }
-    // support cheeks: triangular gussets from the panel up the housing's
-    // side-wall bottom edges (hypotenuse lies along the open-back plane)
-    // (front vertex nudged -0.5 so the gusset overlaps the housing volume
-    // instead of sharing a coincident plane -- keeps the mesh manifold)
+    // side cheeks: close the triangular gap between the panel and the
+    // slab's tilted underside (front vertex nudged -0.5 to overlap the
+    // slab volume — keeps the mesh manifold)
     for (sx = [-slab_w/2, slab_w/2 - cheek_t])
         translate([sx, 0, 0])
             rotate([90, 0, 90])
                 linear_extrude(cheek_t)
-                    polygon([[-0.5, 0], [footY1, 0], [footY1, cheek_h]]);
+                    polygon([[-0.5, 0], [footY1, 0], [footY1, back_h]]);
+    // rear closure: vertical wall from the panel up to the slab's underside
+    // at the rear — the under-void is sealed except the panel aperture
+    // (0.5 rises into the slab volume for manifold overlap)
+    translate([-slab_w/2, footY1 - cheek_t, 0])
+        cube([slab_w, cheek_t, back_h + 0.5]);
     // front apron: closes the gap between the face's bottom lip and the
-    // panel (the housing leans forward of its resting edge)
-    // (rear vertex nudged +0.5 into the housing footprint for the same
-    // manifold-overlap reason as the cheeks)
+    // panel (the slab leans forward of its resting edge)
     translate([-slab_w/2, 0, 0])
         rotate([90, 0, 90])
             linear_extrude(slab_w)
@@ -209,50 +213,38 @@ module display_pod() {
                          [footY0, housing_t * cos(disp_angle)]]);
 }
 
-// ── Snap-in back cover (second printed part) ─────────────────────────────────
-// Local frame = print orientation: plate flat on the bed (z=0..cover_t),
-// x centred, y from 0; tabs and the FireBeetle bosses rise in +z. In the
-// assembly this frame maps 1:1 onto the housing's tilt frame (plate sits in
-// the open back, tabs reach forward toward the face).
-cav_w = slab_w - 2*pod_wall;   // cavity width
-cav_l = slab_l - 2*pod_wall;   // cavity length (along the slope)
-
-module back_cover() {
-    // plate with harness notch at the bottom edge
+// ── Snap-in bottom cover (second printed part) ───────────────────────────────
+// Print orientation: plate flat on the bed, centred on the aperture centre.
+// In the assembly it sits UNDER the panel: the plate overlaps the aperture
+// by cover_lip all round, and two snap tabs per long side rise through the
+// aperture, their nubs clicking out over the panel's top surface. Open cable
+// notch mid-rear edge (+y).
+module bottom_cover() {
     difference() {
-        translate([0, cover_clear, 0])
-            linear_extrude(cover_t)
-                rounded_rect(cav_w - 2*cover_clear, cav_l - 2*cover_clear, 2);
-        translate([-notch_w/2, -1, -1])
-            cube([notch_w, notch_h + 1, cover_t + 2]);
+        linear_extrude(cover_t)
+            offset(3) offset(-3)
+                translate([-(apt_w/2 + cover_lip), -(apt_l/2 + cover_lip)])
+                    square([apt_w + 2*cover_lip, apt_l + 2*cover_lip]);
+        // open notch to the rear edge (cables drop in sideways)
+        translate([-notch_w/2, apt_l/2 + cover_lip - notch_d, -1])
+            cube([notch_w, notch_d + 4, cover_t + 2]);
     }
-    // snap tabs on the side edges: thin fingers with a ramped nub that
-    // clicks outward into the wall slots (lead-in ramp faces the insertion
-    // direction; the square shoulder at nub_z resists pull-out)
-    for (sx = [-1, 1]) {
-        sxo = sx * (cav_w/2 - cover_clear);           // tab outer face x
-        ty  = cav_l/2 - tab_w/2;                      // tab bottom-edge y
-        translate([sx > 0 ? sxo - tab_t : sxo, ty, 0])
-            cube([tab_t, tab_w, tab_reach]);
-        // nub: hull of a tall thin strip at the face (ramp top) and a short
-        // proud strip (shoulder bottom)
+    // snap tabs: two per long (left/right) aperture edge, rising from the
+    // plate through the aperture; ramped nub catches on the panel top face
+    tab_rise = cover_t + panel_thick;   // nub shoulder = panel top surface
+    for (sx = [-1, 1], ty = [-apt_l/4, apt_l/4]) {
+        sxo = sx * (apt_w/2 - cover_clear);   // tab outer face x
+        translate([sx > 0 ? sxo - tab_t : sxo, ty - tab_w/2, 0])
+            cube([tab_t, tab_w, tab_rise + 2.5]);
         hull() {
-            translate([sx > 0 ? sxo - 0.1 : sxo, ty, nub_z])
-                cube([0.1, tab_w, 3.5]);
-            translate([sx > 0 ? sxo : sxo - nub_proud, ty, nub_z])
-                cube([nub_proud, tab_w, 2]);
+            // ramp top (thin strip flush with the tab face)
+            translate([sx > 0 ? sxo - 0.1 : sxo, ty - tab_w/2, tab_rise + 2.5])
+                cube([0.1, tab_w, 0.1]);
+            // shoulder (proud strip just above the panel top)
+            translate([sx > 0 ? sxo : sxo - nub_proud, ty - tab_w/2, tab_rise])
+                cube([nub_proud, tab_w, 0.5]);
         }
     }
-    // FireBeetle DFR0975 bosses (board horizontal, components facing the
-    // display; M2 self-tap)
-    for (dx = [-s3_boss_dx/2, s3_boss_dx/2],
-         dy = [-s3_boss_dy/2, s3_boss_dy/2])
-        translate([dx, cav_l/2 + dy, cover_t])
-            difference() {
-                cylinder(d = 5, h = s3_boss_h);
-                translate([0, 0, 0.5])
-                    cylinder(d = s3_boss_hole_d, h = s3_boss_h + 1);
-            }
 }
 
 // ── Assembly / part selection ────────────────────────────────────────────────
@@ -266,15 +258,13 @@ if (render_part == "fit_test")
         translate([-5, -5, -1])
             cube([panel_len + 10, panel_wid + 10, fit_test_h + 1]);
     }
-if (render_part != "back_cover" && render_part != "fit_test") {
+if (render_part != "bottom_cover" && render_part != "fit_test") {
     panel();
     pod_transform()
         display_pod();
 }
 if (render_part == "all")
-    pod_transform()
-        tilt()
-            translate([0, pod_wall, 0])
-                back_cover();
-if (render_part == "back_cover")
-    back_cover();
+    translate([apt_x0 + apt_w/2, apt_y0 + apt_l/2, -cover_t])
+        bottom_cover();
+if (render_part == "bottom_cover")
+    bottom_cover();
