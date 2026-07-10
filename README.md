@@ -47,10 +47,13 @@ affiliated with, endorsed by, or supported by La Marzocco.
 | Machine link | UART to the machine's CN11 connector, carrying the GICAR protocol used by the stock panel |
 | Scale (optional) | Felicita Arc or Bookoo Themis Ultra, via BLE |
 
+**Wiring instructions — display, CN11 interface circuit, and power — are in
+[docs/WIRING.md](docs/WIRING.md).** Deeper pin history lives in
+`reference/lm_mini/` and the per-environment comments in `platformio.ini`.
+
 An ESP32-C6 build environment (FireBeetle 2 ESP32-C6 / DFR1075) is also
 defined and builds from the same source, but the S3 is the actively
-maintained and deployed target. Wiring notes and pin history live in
-`reference/lm_mini/` and the per-environment comments in `platformio.ini`.
+maintained and deployed target.
 
 > **CN11 wiring caveat:** the harness's TXD/RXD labels at the CN11 plug are
 > crossed relative to what the wire colours and pull-up placement suggest.
@@ -101,7 +104,8 @@ publishes a release with `firmware.bin` and a `version.json` manifest — see
 | `include/` | Headers, LVGL configuration, `version.h`, `secrets.h.example` |
 | `tools/` | Build-info generator, LAN OTA server, espota fallback |
 | `cad/` | OpenSCAD design and STLs for the machine-mounted display housing |
-| `reference/` | Protocol captures and wiring notes |
+| `docs/` | Wiring instructions ([WIRING.md](docs/WIRING.md)) |
+| `reference/` | Protocol captures and historical wiring notes |
 | `.github/workflows/` | Tagged-release build pipeline |
 
 ## Safety
