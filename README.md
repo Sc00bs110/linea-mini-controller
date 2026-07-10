@@ -3,6 +3,11 @@
 An open-source ESP32-S3 touchscreen controller for the La Marzocco Linea Mini
 espresso machine.
 
+<p align="center">
+  <img src="photos/controller-installed.jpg" alt="Controller in its 3D-printed housing, installed on top of a La Marzocco Linea Mini" height="420">
+  <img src="photos/main-screen.jpg" alt="Main screen close-up: boiler temperature, target temperature and brew weight, cleaning countdown, and HEAT/STEAM/MENU/CLEAN touch buttons" height="420">
+</p>
+
 This project replaces the Linea Mini's stock control panel with a 3.5″ colour
 touchscreen, adding brew-by-weight, shot timing, a cleaning-cycle reminder,
 standby scheduling, Home Assistant integration, and over-the-air firmware
