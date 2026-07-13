@@ -1694,23 +1694,54 @@ void ui_tick() {
             break;
     }
 
-    // Brew-by-weight auto-offset learning: ~6 s after a bbw-stopped shot ends
-    // (drips settled), nudge the pre-stop offset by half the target error so
-    // the next shot lands closer. Clamped to the offset's settings range.
-    static uint32_t s_bbw_settle_ms = 0;
-    if (s_bbw_settle_ms != 0 && millis() - s_bbw_settle_ms >= 6000) {
-        s_bbw_settle_ms = 0;
-        if (scale_connected()) {
-            float final_g = scale_weight();
-            float err = final_g - settings.brew_target_g;
-            if (final_g > 5.0f && fabsf(err) <= 10.0f) {
-                float o = settings.prestop_offset_g + 0.5f * err;
-                if (o < 0.0f) o = 0.0f;
-                if (o > 8.0f) o = 8.0f;
-                wlogf("[bbw] auto-offset: final=%.1fg target=%.0fg offset %.1f -> %.1f\n",
-                      final_g, settings.brew_target_g, settings.prestop_offset_g, o);
-                settings.prestop_offset_g = o;
-                settings_save();
+    // Brew-by-weight auto-offset learning: once the weight settles after a
+    // bbw-stopped shot, nudge the pre-stop offset toward the target error so the
+    // next shot lands closer. Settle = drift under SETTLE_BAND held for
+    // SETTLE_HOLD_MS; stability is not checked until SETTLE_QUIET_MS because the
+    // immediate post-stop drip stream is turbulent. Learning is abandoned on a
+    // cup lift, a scale dropout, or if the weight never settles within
+    // LEARN_TIMEOUT_MS. Offset is clamped to its settings range.
+    static uint32_t s_bbw_arm_ms = 0;    // brew-end millis; 0 = not learning
+    static uint32_t s_bbw_ref_ms = 0;    // when the settle reference was last reset
+    static float    s_bbw_ref_w  = 0.0f; // settle reference weight
+    static float    s_bbw_peak_w = 0.0f; // peak weight since brew end (cup-removal guard)
+    if (s_bbw_arm_ms != 0) {
+        const uint32_t SETTLE_QUIET_MS  = 1000;
+        const uint32_t SETTLE_HOLD_MS   = 2000;
+        const uint32_t LEARN_TIMEOUT_MS = 15000;
+        const float    SETTLE_BAND      = 0.2f;
+        const float    CUP_DROP_G       = 2.0f;
+        uint32_t since_end = millis() - s_bbw_arm_ms;
+        if (!scale_connected()) {
+            s_bbw_arm_ms = 0;
+        } else {
+            float w = scale_weight();
+            if (w > s_bbw_peak_w) s_bbw_peak_w = w;
+            if (w < s_bbw_peak_w - CUP_DROP_G) {
+                wlogf("[bbw] auto-offset aborted: cup lifted (w=%.1f peak=%.1f)\n", w, s_bbw_peak_w);
+                s_bbw_arm_ms = 0;
+            } else if (since_end >= LEARN_TIMEOUT_MS) {
+                wlogf("[bbw] auto-offset aborted: no settle in 15s\n");
+                s_bbw_arm_ms = 0;
+            } else if (since_end >= SETTLE_QUIET_MS) {
+                if (fabsf(w - s_bbw_ref_w) >= SETTLE_BAND) {
+                    s_bbw_ref_w  = w;
+                    s_bbw_ref_ms = millis();
+                } else if (millis() - s_bbw_ref_ms >= SETTLE_HOLD_MS) {
+                    // Asymmetric gain: overshoot corrects faster than undershoot.
+                    float err = w - settings.brew_target_g;
+                    if (w > 5.0f && fabsf(err) <= 10.0f) {
+                        float gain = err > 0.0f ? 0.5f : 0.3f;
+                        float o = settings.prestop_offset_g + gain * err;
+                        if (o < 0.0f) o = 0.0f;
+                        if (o > 8.0f) o = 8.0f;
+                        wlogf("[bbw] auto-offset: final=%.1fg target=%.0fg offset %.1f -> %.1f\n",
+                              w, settings.brew_target_g, settings.prestop_offset_g, o);
+                        settings.prestop_offset_g = o;
+                        settings_save();
+                    }
+                    s_bbw_arm_ms = 0;
+                }
             }
         }
     }
@@ -1719,6 +1750,7 @@ void ui_tick() {
         brew_start_ms  = millis();
         scale_tare_and_start();
         bbw_stop_fired = false;
+        s_bbw_arm_ms   = 0;   // a new shot supersedes any pending learn
         // During a cleaning cycle the overlay is the UI — no shot timer.
         if (cur_screen == UI_MAIN && !machine_clean_active()) ui_show_timer();
     }
@@ -1743,7 +1775,12 @@ void ui_tick() {
             settings.shots_since_clean++;
         }
         // Arm auto-offset learning only for shots this firmware stopped.
-        if (bbw_stop_fired && scale_connected()) s_bbw_settle_ms = millis();
+        if (bbw_stop_fired && scale_connected()) {
+            s_bbw_arm_ms = millis();
+            s_bbw_ref_ms = millis();
+            s_bbw_ref_w  = scale_weight();
+            s_bbw_peak_w = scale_weight();
+        }
     }
     if (returning_brew && (millis() - brew_end_ms) >= 3000) {
         returning_brew = false;

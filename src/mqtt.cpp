@@ -176,6 +176,14 @@ static void publish_discovery() {
         "\"dev_cla\":\"temperature\",\"unit_of_meas\":\"\\u00b0C\","
         "\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
 
+    // Learned brew-by-weight pre-stop offset — the machine stops the shot this
+    // many grams before target to allow for post-stop drip.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/prestop_offset/config",
+        "{\"name\":\"Pre-stop offset\",\"uniq_id\":\"lm_mini_prestop_offset\","
+        "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.prestop_offset}}\","
+        "\"unit_of_meas\":\"g\",\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
+
     // Firmware OTA trigger — press publishes "PRESS" to the ota command topic,
     // which pulls firmware.bin from the build PC (see OTA_DEFAULT_URL).
     pub_retained(
@@ -184,7 +192,7 @@ static void publish_discovery() {
         "\"cmd_t\":\"" MQTT_CMD_OTA "\",\"pl_prs\":\"PRESS\","
         AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (12 entities)\n");
+    wlogf("[mqtt] HA discovery published (13 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -206,11 +214,11 @@ static void publish_state() {
     bool in_frame; int rxlen;
     gicar_rx_state(&in_frame, &rxlen);
 
-    char state[416];
+    char state[448];
     snprintf(state, sizeof(state),
         "{\"temp\":%.1f,\"target_temp\":%.1f,\"machine_setpoint\":%.1f,\"brew\":\"%s\","
         "\"steam\":\"%s\",\"standby\":\"%s\",\"shots\":%u,\"shots_since_clean\":%u,\"last_clean\":\"%s\","
-        "\"machine\":\"%s\",\"scale\":\"%s\",\"weight\":%.1f,"
+        "\"machine\":\"%s\",\"scale\":\"%s\",\"weight\":%.1f,\"prestop_offset\":%.1f,"
         "\"rx\":%lu,\"in_frame\":%d,\"rxlen\":%d,\"dbg\":\"%s\"}",
         machine.coffee_temp_c,
         settings.coffee_temp_c,
@@ -224,6 +232,7 @@ static void publish_state() {
         machine.connected    ? "ON" : "OFF",
         scale_connected()    ? "ON" : "OFF",
         scale_weight(),
+        settings.prestop_offset_g,
         gicar_rx_total(),
         in_frame ? 1 : 0,
         rxlen,
