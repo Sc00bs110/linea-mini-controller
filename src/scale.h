@@ -12,6 +12,7 @@ struct ScaleState {
     volatile uint32_t timer_ms;     // scale timer — Bookoo only
     volatile uint8_t  battery_pct;  // 0–100 — Bookoo only
     bool          stable;
+    volatile uint32_t last_weight_ms;  // millis() of last weight notify (0 = none yet)
 };
 
 extern ScaleState scale;
@@ -27,6 +28,9 @@ void  scale_tare_and_start();
 
 bool        scale_connected();
 float       scale_weight();         // current weight in grams (0.0 if disconnected)
+// Milliseconds since the last weight notification (UINT32_MAX if none received
+// yet). Used by the UI's brew-by-weight failsafe to detect a stalled scale feed.
+uint32_t    scale_weight_age_ms();
 const char* scale_model_name();     // "Felicita Arc" / "Bookoo Themis Ultra" / "—"
 
 // Suspend/resume BLE scanning while an OTA transfer runs — scanning on the

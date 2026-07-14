@@ -52,6 +52,18 @@ C6 firmware — see that plan's Context section for why this supersedes the orig
   control during bring-up and testing. See the `esp-pio-handling` / `esp-idf-handling`
   and `workbench-*` skills for driving it.
 
+## Machine Facts
+
+- **Brew lever orientation**: the Linea Mini's brew lever moves **left to "Brew" and
+  right to "Stop"** — it is NOT an up/down paddle. Avoid "lever up/down/lifted" wording
+  in code comments, logs, and docs.
+- The R-frame brew flag (payload[17]) **follows the lever position**, not the pump:
+  after a firmware brew stop it stays set (pump=0) until the user moves the lever to
+  Stop (confirmed live 2026-07-14, 10 s lever hold after auto-stop).
+- Register `0x8000` ("brew stop" in early docs) is a factory **test-mode relay** and is
+  rejected outside test mode — confirmed live 2026-07-14 (pump kept running through the
+  write). The only working firmware brew stop is the standby toggle.
+
 ## Firmware Versioning
 
 Every build must embed a fresh, auto-generated build identifier — there is no manual

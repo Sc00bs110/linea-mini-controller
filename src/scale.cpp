@@ -34,11 +34,20 @@
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 
-ScaleState scale = { SCALE_NONE, false, 0.0f, 0.0f, 0, 0, true };
+ScaleState scale = { SCALE_NONE, false, 0.0f, 0.0f, 0, 0, true, 0 };
 
 static NimBLEAddress s_target_addr;
 static ScaleModel    s_target_model = SCALE_NONE;
 static bool          s_found = false;
+
+// Scan-cadence state (see the no-scale pause in scale_ble_task): scan fast until
+// the first-ever connect, and for a window after any disconnect, so an in-use
+// scale reconnects quickly; relax afterwards to protect WiFi coexistence.
+static bool          s_scale_ever_connected = false;
+static uint32_t      s_last_disconnect_ms   = 0;    // millis() of last link drop (0 = none)
+static const uint32_t SCAN_FAST_MS          = 2000;  // no-scale pause while a scale is expected
+static const uint32_t SCAN_RELAXED_MS       = 15000; // no-scale pause once idle (WiFi protection)
+static const uint32_t RECONNECT_FAST_WIN_MS = 60000; // fast-scan window after a disconnect
 static volatile bool s_ota_hold = false;  // set from the OTA task (see scale.h)
 // True only while the scale task is parked at its gate (no NimBLE calls in
 // flight). scale_radio_release() waits for this before NimBLEDevice::deinit(),
@@ -93,11 +102,12 @@ static void bookoo_notify_cb(NimBLERemoteCharacteristic* pChar,
 
     uint8_t batt = pData[13];
 
-    scale.weight_g    = w;
-    scale.flow_gps    = f;
-    scale.timer_ms    = ms;
-    scale.battery_pct = batt;
-    scale.stable      = true;
+    scale.weight_g       = w;
+    scale.flow_gps       = f;
+    scale.timer_ms       = ms;
+    scale.battery_pct    = batt;
+    scale.stable         = true;
+    scale.last_weight_ms = millis();  // timestamp for the UI bbw staleness failsafe
 }
 
 static bool bookoo_subscribe(NimBLEClient* pClient) {
@@ -133,8 +143,9 @@ static void felicita_notify_cb(NimBLERemoteCharacteristic* pChar,
     uint16_t raw = ((uint16_t)pData[1] << 8) | pData[2];
     float w = raw / 10.0f;
     if (len >= 4 && pData[3] == 1) w = -w;  // negative reading
-    scale.weight_g = w;
-    scale.stable   = (len >= 5) ? ((pData[4] & 0x02) == 0) : true;
+    scale.weight_g       = w;
+    scale.stable         = (len >= 5) ? ((pData[4] & 0x02) == 0) : true;
+    scale.last_weight_ms = millis();  // timestamp for the UI bbw staleness failsafe
 }
 
 static bool felicita_subscribe(NimBLEClient* pClient) {
@@ -256,9 +267,14 @@ static void scale_ble_task(void*) {
         // during an OTA transfer (see scale_set_ota_hold / scale_radio_release).
         // Publish s_ble_parked while waiting so scale_radio_release() can safely
         // deinit BLE from another task: no NimBLE calls run on this task here.
-        if (machine.brew_active || s_ota_hold) {
+        // Also park while the machine is in standby (only when not already
+        // connected to a scale): nobody brews on a sleeping machine, and
+        // continuous scanning degrades WiFi/MQTT overnight (observed
+        // 2026-07-14: OTA triggers lost to MQTT reconnect churn).
+        if (machine.brew_active || s_ota_hold || machine.standby) {
             s_ble_parked = true;
-            while (machine.brew_active || s_ota_hold) vTaskDelay(pdMS_TO_TICKS(500));
+            while (machine.brew_active || s_ota_hold || machine.standby)
+                vTaskDelay(pdMS_TO_TICKS(500));
             s_ble_parked = false;
         }
 
@@ -289,9 +305,22 @@ static void scale_ble_task(void*) {
         if (s_ota_hold) continue;
 
         if (!s_found) {
-            // 30s pause between scans when no scale found — BLE scan thrashes the
-            // shared WiFi radio; short pauses cause MQTT dropouts.
-            vTaskDelay(pdMS_TO_TICKS(30000));
+            // BLE scanning thrashes the shared WiFi radio, so pauses between scans
+            // protect MQTT/OTA. But scan FAST (2 s) until the first-ever connect,
+            // and for RECONNECT_FAST_WIN_MS after a disconnect, so an in-use scale
+            // is (re)found quickly — an awake scale sleeps within minutes, and a
+            // long cadence often meant never catching it. Relax to 15 s once a
+            // scale has been gone a while (idle machine, no scale around).
+            // Fast from boot until the first-ever connect, but time-bounded so a
+            // scaleless machine doesn't scan at ~83% duty forever (which would
+            // thrash the shared radio the relaxed cadence exists to protect); and
+            // fast for a window after any disconnect for quick reconnection.
+            bool since_boot_fast = !s_scale_ever_connected &&
+                                   millis() < RECONNECT_FAST_WIN_MS;
+            bool since_drop_fast = s_last_disconnect_ms != 0 &&
+                                   millis() - s_last_disconnect_ms < RECONNECT_FAST_WIN_MS;
+            bool fast = since_boot_fast || since_drop_fast;
+            vTaskDelay(pdMS_TO_TICKS(fast ? SCAN_FAST_MS : SCAN_RELAXED_MS));
             continue;
         }
 
@@ -329,8 +358,9 @@ static void scale_ble_task(void*) {
             continue;
         }
 
-        scale.model     = s_target_model;
-        scale.connected = true;
+        scale.model            = s_target_model;
+        scale.connected        = true;
+        s_scale_ever_connected = true;  // gates scan cadence (see no-scale pause above)
         wlogf("[scale] %s connected\n", scale_model_name());
 
         // ── Stay connected ───────────────────────────────────────────────────
@@ -348,12 +378,14 @@ static void scale_ble_task(void*) {
             vTaskDelay(pdMS_TO_TICKS(200));
         }
 
-        scale.connected   = false;
-        scale.weight_g    = 0.0f;
-        scale.flow_gps    = 0.0f;
-        scale.timer_ms    = 0;
-        scale.battery_pct = 0;
-        scale.model       = SCALE_NONE;
+        scale.connected      = false;
+        scale.weight_g       = 0.0f;
+        scale.flow_gps       = 0.0f;
+        scale.timer_ms       = 0;
+        scale.battery_pct    = 0;
+        scale.model          = SCALE_NONE;
+        scale.last_weight_ms = 0;            // no live feed → bbw failsafe sees "never"
+        s_last_disconnect_ms = millis();     // fast-rescan window for a quick reconnect
         s_bookoo_write_char   = nullptr;
         s_bookoo_pending_cmd  = 0;
         wlogf("[scale] disconnected — rescanning in 3s\n");
@@ -396,6 +428,12 @@ bool scale_connected() {
 
 float scale_weight() {
     return scale.weight_g;
+}
+
+uint32_t scale_weight_age_ms() {
+    uint32_t t = scale.last_weight_ms;
+    if (t == 0) return UINT32_MAX;   // no weight notify received yet this session
+    return millis() - t;
 }
 
 const char* scale_model_name() {

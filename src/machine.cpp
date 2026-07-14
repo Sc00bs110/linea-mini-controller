@@ -10,6 +10,9 @@ MachineState machine = {};
 
 // Pending brew-stop wake: non-zero means send wake command at that millis() value.
 static uint32_t s_brew_stop_wake_ms = 0;
+// Set by machine_brew_stop_standby(); triggers a second wake after the lever
+// returns to Stop (the machine queues the mid-brew standby until then).
+static bool s_stop_wake_pending = false;
 
 // Disconnect timeout: mark the machine offline if no R or Z frame arrives within
 // this window. The R-frame poll runs at ~760 ms, so 3 s tolerates a few misses.
@@ -32,6 +35,19 @@ static const uint16_t STANDBY_SYNC_REGS[] = {0x0400, 0x0401, 0x0402, 0x0406};
 // Write a single byte to a Gicar register. Most commands are 1-byte payloads.
 static void gicar_write_byte(uint16_t addr, uint8_t value) {
     gicar_write(addr, &value, 1);
+}
+
+// Standby-toggle brew stop: force standby (0x0000=0x00 + config-sync regs), then
+// wake 500 ms later via the timer in machine_update(). Side effects observed in
+// the field: the group's reheat and the next pull can need a lever cycle when the
+// lever returns during the standby/wake window (a 10 s lever hold after the stop
+// reheated fine, 2026-07-14). This is the only working stop — see machine_brew_stop().
+static void machine_brew_stop_standby() {
+    gicar_write_byte(0x0000, 0x00);
+    for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
+    s_brew_stop_wake_ms = millis() + 500;
+    s_stop_wake_pending = true;   // second wake once the lever returns to Stop
+    wlogf("[machine] brew_stop: standby sent, wake in 500ms\n");
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -64,7 +80,7 @@ void machine_update() {
     // Drain Serial1, run the poll cadence, and parse any R/Z frames.
     gicar_process();
 
-    // ── Brew-stop wake: fires 500 ms after machine_brew_stop() ──────────────────
+    // ── Brew-stop wake: fires 500 ms after machine_brew_stop_standby() ──────────
     if (s_brew_stop_wake_ms != 0 && millis() >= s_brew_stop_wake_ms) {
         s_brew_stop_wake_ms = 0;
         gicar_write_byte(0x0000, 0x01);
@@ -95,6 +111,18 @@ void machine_update() {
             if (millis() - s_brew_false_ms > 1000) {
                 machine.brew_active = false;
                 s_brew_false_ms     = 0;
+                // A standby-toggle stop sent mid-brew gets queued by the machine
+                // while the lever holds it in brew: the pump cuts immediately but
+                // the standby itself applies only once the lever returns to Stop
+                // (field-observed 2026-07-14: machine dropped into standby at
+                // lever return after every bbw stop). The mid-brew wake 500 ms
+                // after the stop is ignored, so send a SECOND wake shortly after
+                // the lever actually returns to undo the queued standby.
+                if (s_stop_wake_pending) {
+                    s_stop_wake_pending  = false;
+                    s_brew_stop_wake_ms  = millis() + 500;
+                    wlogf("[machine] brew_stop: lever returned — post-stop wake in 500ms\n");
+                }
             }
         }
 
@@ -130,12 +158,12 @@ void machine_update() {
             machine_clean_stop();
         } else if (s_clean_pulses_left > 0) {
             // A pulse landing on an already-running cycle aborts it after the
-            // first pump phase (observed live: lever lifted 2 s into the
+            // first pump phase (observed live: lever moved to Brew 2 s into the
             // burst → cycle died). If the brew starts early, drop the rest.
             if (machine.brew_active) {
                 s_clean_pulses_left = 0;
                 gicar_set_poll_period(10000);
-                wlogf("[machine] clean: lever up mid-burst — remaining pulses dropped\n");
+                wlogf("[machine] clean: lever to Brew mid-burst — remaining pulses dropped\n");
             } else if (millis() >= s_clean_next_pulse_ms) {
                 s_clean_next_pulse_ms = millis() + 1000;
                 s_clean_pulses_left--;
@@ -264,12 +292,13 @@ void machine_set_standby(bool standby) {
           standby, (!standby && settings.steam_on));
 }
 
-// Brew stop: standby (0x0000=0x00 + sync regs) stops the pump even with the lever
-// held — confirmed empirically 2026-06-25. Wake is sent 500 ms later via the timer
-// in machine_update(). machine.standby is NOT set so the UI stays in "active" state.
+// Brew stop: standby toggle, sent immediately. The 0x8000 "pump relay" write was
+// tried first (2026-07-14) and confirmed live to do nothing — the GICAR rejects
+// test-relay writes outside factory test mode (R-frames kept brew=1 pump=1 right
+// through it), so every stop was really the fallback firing 3.5 s late, adding
+// ~8-10 g of overshoot at test-shot flow rates. The lever machine has no factory
+// remote-stop command; the standby toggle is the only working stop we have.
+// machine.standby is NOT set so the UI stays in "active" state.
 void machine_brew_stop() {
-    gicar_write_byte(0x0000, 0x00);
-    for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
-    s_brew_stop_wake_ms = millis() + 500;
-    wlogf("[machine] brew_stop: standby sent, wake in 500ms\n");
+    machine_brew_stop_standby();
 }

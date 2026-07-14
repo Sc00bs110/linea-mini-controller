@@ -99,6 +99,11 @@ static uint32_t brew_end_ms    = 0;
 static bool     returning_brew = false;
 // shot_count lives in settings.shot_count (persisted to NVS)
 static bool     bbw_stop_fired = false;
+// True while brew-by-weight applies to the CURRENT shot: latched at shot start
+// when a scale is connected (and it's not a cleaning cycle). Gates both the normal
+// weight-target stop and the scale-loss failsafe so neither fires on a non-bbw
+// shot (demo, or a real shot with no scale).
+static bool     bbw_armed = false;
 
 // ─── Demo mode ────────────────────────────────────────────────────────────────
 static bool     demo_brew       = false;
@@ -145,6 +150,8 @@ static lv_obj_t *lbl_clean_overlay_title;
 static lv_obj_t *lbl_clean_overlay_sub;
 static lv_obj_t *lbl_clean_count;
 static lv_obj_t *obj_clean_stop;
+static lv_obj_t *obj_standby;
+static lv_obj_t *lbl_standby;
 
 // Cleaning-cycle UI state machine (drives the overlay through the process).
 // The LM backflush runs CLEAN_PHASES pump phases (~5 s pump + ~10 s pause).
@@ -168,6 +175,9 @@ static uint32_t s_settemp_touched_ms = 0;
 
 // CLEAN hold-to-start state (see ui_tick()).
 static uint32_t s_clean_press_ms = 0;
+
+// STANDBY hold-to-sleep state (see ui_tick()).
+static uint32_t s_standby_press_ms = 0;
 
 static void target_show() {
     char buf[12];
@@ -218,6 +228,31 @@ static void clean_press_cb(lv_event_t *e) {
     }
 }
 
+// STANDBY pill: while awake, PRESSED starts a 1 s hold window (checked in
+// ui_tick()); releasing early cancels. The pill turns amber while armed. While
+// in standby, presses are ignored here — a plain tap wakes via standby_click_cb.
+static void standby_press_cb(lv_event_t *e) {
+    if (machine.standby) return;   // WAKE tap is handled by standby_click_cb
+    lv_event_code_t c = lv_event_get_code(e);
+    if (c == LV_EVENT_PRESSED) {
+        s_standby_press_ms = millis();
+        lv_obj_set_style_bg_color(obj_standby, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_obj_set_style_text_color(lbl_standby, lv_color_black(), 0);
+    } else {  // RELEASED / PRESS_LOST
+        s_standby_press_ms = 0;
+        lv_obj_set_style_bg_color(obj_standby, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_text_color(lbl_standby, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    }
+}
+
+// A plain tap wakes only while in standby; the awake action is hold-to-sleep.
+static void standby_click_cb(lv_event_t *e) {
+    if (machine.standby) {
+        machine_set_standby(false);
+        wlogf("[ui] standby button: wake\n");
+    }
+}
+
 static void clean_overlay_click(lv_event_t *e) {
     switch (s_clean_stage) {
         case CLEAN_PREP:
@@ -240,7 +275,7 @@ static void clean_show_done(const char* title) {
     s_clean_stage = CLEAN_DONE;
     lv_label_set_text(lbl_clean_overlay_title, title);
     lv_label_set_text(lbl_clean_overlay_sub,
-                      "Lower the brew lever.\nTap to close.");
+                      "Move the lever to Stop.\nTap to close.");
     lv_obj_add_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
 }
@@ -466,6 +501,28 @@ static void ui_main_create() {
     lv_obj_align(lbl_menu, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(lbl_menu, LV_OBJ_FLAG_CLICKABLE);
 
+    // STANDBY: hold 1 s to drop the machine into standby (fires in ui_tick()).
+    // Top-centre between the HEAT and STEAM pills (bottom-centre is MENU's spot).
+    // Waking is handled by the sleep overlay's tap-anywhere, not this pill.
+    obj_standby = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_standby, 120, 32);
+    lv_obj_align(obj_standby, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_set_style_radius(obj_standby, 16, 0);
+    lv_obj_set_style_border_width(obj_standby, 0, 0);
+    lv_obj_set_style_bg_color(obj_standby, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_pad_all(obj_standby, 0, 0);
+    lv_obj_clear_flag(obj_standby, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_standby, standby_press_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(obj_standby, standby_press_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(obj_standby, standby_press_cb, LV_EVENT_PRESS_LOST, NULL);
+    lv_obj_add_event_cb(obj_standby, standby_click_cb, LV_EVENT_CLICKED, NULL);
+    lbl_standby = lv_label_create(obj_standby);
+    lv_label_set_text(lbl_standby, "STANDBY");
+    lv_obj_set_style_text_font(lbl_standby, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_standby, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    lv_obj_align(lbl_standby, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(lbl_standby, LV_OBJ_FLAG_CLICKABLE);
+
     // Sleeping cover: shown while machine.standby is set (schedule or HA).
     // Created last so it sits above every other main-screen widget.
     obj_sleep_overlay = lv_obj_create(scr_main);
@@ -527,6 +584,18 @@ static void ui_main_update() {
         heat ? lv_color_make(0xE5, 0x39, 0x35) : lv_color_make(0x28, 0x28, 0x28), 0);
     lv_obj_set_style_text_color(lbl_heat,
         heat ? lv_color_white() : lv_color_make(0x70, 0x70, 0x70), 0);
+
+    // STANDBY pill: WAKE + amber while in standby; else grey "STANDBY". Skip the
+    // awake repaint while a hold is in progress so the amber press feedback shows.
+    if (machine.standby) {
+        lv_label_set_text(lbl_standby, "WAKE");
+        lv_obj_set_style_bg_color(obj_standby, lv_color_make(0xD4, 0x89, 0x1A), 0);
+        lv_obj_set_style_text_color(lbl_standby, lv_color_black(), 0);
+    } else if (s_standby_press_ms == 0) {
+        lv_label_set_text(lbl_standby, "STANDBY");
+        lv_obj_set_style_bg_color(obj_standby, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_text_color(lbl_standby, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    }
 
     if (get_brew_active())
         lv_obj_clear_flag(lbl_brew, LV_OBJ_FLAG_HIDDEN);
@@ -1458,11 +1527,13 @@ static void ui_sched_update() {
 // ─── Screen switchers ──────────────────────────────────────────────────────────
 
 static void ui_show_main() {
+    wlogf("[ui] show main (was %d)\n", cur_screen);
     cur_screen = UI_MAIN;
     lv_scr_load(scr_main);
 }
 
 static void ui_show_timer() {
+    wlogf("[ui] show timer (was %d)\n", cur_screen);
     cur_screen = UI_TIMER;
     char sbuf[16];
     // +1: the increment now happens at shot end, so during the pull the
@@ -1612,6 +1683,17 @@ void ui_tick() {
         wlogf("[ui] clean cycle armed (2s hold)\n");
     }
 
+    // STANDBY hold-to-sleep: fires once the pill has been held for 1 s. Never
+    // drops the machine into standby mid-shot or mid-cleaning-cycle.
+    if (s_standby_press_ms != 0 && millis() - s_standby_press_ms >= 1000 &&
+        !brew_now && !machine_clean_active()) {
+        s_standby_press_ms = 0;
+        lv_obj_set_style_bg_color(obj_standby, lv_color_make(0x28, 0x28, 0x28), 0);
+        lv_obj_set_style_text_color(lbl_standby, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+        machine_set_standby(true);
+        wlogf("[ui] standby button: sleep\n");
+    }
+
     // ── Standby schedule: fire once at each sleep/wake edge ─────────────────────
     // Edge-triggered on the minute so a manual wake (or HA command) between the
     // edges is never fought. Sleep is skipped while a brew or cleaning cycle is
@@ -1651,7 +1733,7 @@ void ui_tick() {
     // ── Cleaning-cycle overlay state machine ────────────────────────────────────
     switch (s_clean_stage) {
         case CLEAN_PREP:
-            // Burst finished — now (and only now) invite the lever. Lifting it
+            // Burst finished — now (and only now) invite the lever. Moving it to Brew
             // during the burst poisons the cycle (pulses landing mid-cycle
             // abort it after one phase).
             if (machine_clean_ready()) {
@@ -1671,7 +1753,7 @@ void ui_tick() {
                 lv_obj_clear_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_clear_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
             } else if (!machine_clean_active()) {
-                // Window expired before the lever was lifted.
+                // Window expired before the lever was moved to Brew.
                 s_clean_stage = CLEAN_IDLE;
                 lv_obj_add_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
             }
@@ -1694,74 +1776,51 @@ void ui_tick() {
             break;
     }
 
-    // Brew-by-weight auto-offset learning: once the weight settles after a
-    // bbw-stopped shot, nudge the pre-stop offset toward the target error so the
-    // next shot lands closer. Settle = drift under SETTLE_BAND held for
-    // SETTLE_HOLD_MS; stability is not checked until SETTLE_QUIET_MS because the
-    // immediate post-stop drip stream is turbulent. Learning is abandoned on a
-    // cup lift, a scale dropout, or if the weight never settles within
-    // LEARN_TIMEOUT_MS. Offset is clamped to its settings range.
-    static uint32_t s_bbw_arm_ms = 0;    // brew-end millis; 0 = not learning
-    static uint32_t s_bbw_ref_ms = 0;    // when the settle reference was last reset
-    static float    s_bbw_ref_w  = 0.0f; // settle reference weight
-    static float    s_bbw_peak_w = 0.0f; // peak weight since brew end (cup-removal guard)
-    if (s_bbw_arm_ms != 0) {
-        const uint32_t SETTLE_QUIET_MS  = 1000;
-        const uint32_t SETTLE_HOLD_MS   = 2000;
-        const uint32_t LEARN_TIMEOUT_MS = 15000;
-        const float    SETTLE_BAND      = 0.2f;
-        const float    CUP_DROP_G       = 2.0f;
-        uint32_t since_end = millis() - s_bbw_arm_ms;
-        if (!scale_connected()) {
-            s_bbw_arm_ms = 0;
-        } else {
-            float w = scale_weight();
-            if (w > s_bbw_peak_w) s_bbw_peak_w = w;
-            if (w < s_bbw_peak_w - CUP_DROP_G) {
-                wlogf("[bbw] auto-offset aborted: cup lifted (w=%.1f peak=%.1f)\n", w, s_bbw_peak_w);
-                s_bbw_arm_ms = 0;
-            } else if (since_end >= LEARN_TIMEOUT_MS) {
-                wlogf("[bbw] auto-offset aborted: no settle in 15s\n");
-                s_bbw_arm_ms = 0;
-            } else if (since_end >= SETTLE_QUIET_MS) {
-                if (fabsf(w - s_bbw_ref_w) >= SETTLE_BAND) {
-                    s_bbw_ref_w  = w;
-                    s_bbw_ref_ms = millis();
-                } else if (millis() - s_bbw_ref_ms >= SETTLE_HOLD_MS) {
-                    // Asymmetric gain: overshoot corrects faster than undershoot.
-                    float err = w - settings.brew_target_g;
-                    if (w > 5.0f && fabsf(err) <= 10.0f) {
-                        float gain = err > 0.0f ? 0.5f : 0.3f;
-                        float o = settings.prestop_offset_g + gain * err;
-                        if (o < 0.0f) o = 0.0f;
-                        if (o > 8.0f) o = 8.0f;
-                        wlogf("[bbw] auto-offset: final=%.1fg target=%.0fg offset %.1f -> %.1f\n",
-                              w, settings.brew_target_g, settings.prestop_offset_g, o);
-                        settings.prestop_offset_g = o;
-                        settings_save();
-                    }
-                    s_bbw_arm_ms = 0;
-                }
-            }
-        }
-    }
+    // Pre-stop offset is manually adjusted (settings screen); the auto-offset
+    // learner was removed 2026-07-14 — cup removal right after the shot made
+    // settled-weight measurement too unreliable to learn from.
 
     if (!was_brew && brew_now) {
         brew_start_ms  = millis();
         scale_tare_and_start();
         bbw_stop_fired = false;
-        s_bbw_arm_ms   = 0;   // a new shot supersedes any pending learn
+        // Brew-by-weight applies to this shot only if a scale is connected at the
+        // start (and it's a real shot, not a cleaning-cycle pump phase). Latch it
+        // so a mid-shot scale dropout still counts as bbw (the failsafe stops it).
+        bbw_armed = scale_connected() && settings.brew_target_g > 0.0f &&
+                    !machine_clean_active();
+        wlogf("[bbw] shot start: armed=%d scale=%d target=%.1f offset=%.1f\n",
+              bbw_armed, scale_connected(), settings.brew_target_g,
+              settings.prestop_offset_g);
         // During a cleaning cycle the overlay is the UI — no shot timer.
         if (cur_screen == UI_MAIN && !machine_clean_active()) ui_show_timer();
     }
 
-    // Brew-by-weight auto-stop (gated by BREW_STOP_ENABLED in machine.cpp)
-    if (brew_now && cur_screen == UI_TIMER && !bbw_stop_fired) {
-        float threshold = settings.brew_target_g - settings.prestop_offset_g;
-        if (threshold > 0 && get_display_weight() >= threshold) {
+    // Brew-by-weight auto-stop + scale-loss failsafe. Evaluated every loop during
+    // an armed shot regardless of which screen is showing (the old UI_TIMER gate is
+    // gone) so a shot never runs away silently after the user navigates off the
+    // timer. Only armed shots reach here, so non-bbw shots are unaffected.
+    if (brew_now && bbw_armed && !bbw_stop_fired && !machine_clean_active()) {
+        // Disconnect fires immediately; staleness only after the shot has run 3 s,
+        // so a shot that starts in the brief gap between BLE connect and the first
+        // weight notify isn't stopped at ~0 g. Streaming scales keep age < 200 ms,
+        // so a genuine mid-shot feed loss is still caught promptly after that.
+        bool scale_lost = !scale_connected() ||
+                          (millis() - brew_start_ms > 3000 && scale_weight_age_ms() > 3000);
+        if (scale_lost) {
+            // Failsafe: an armed shot with no live weight can't reach its target,
+            // so never let it keep running blind.
             machine_brew_stop();
             bbw_stop_fired = true;
-            Serial.printf("[bbw] threshold %.1fg reached\n", threshold);
+            wlogf("[bbw] FAILSAFE stop: scale data lost mid-shot\n");
+        } else {
+            float threshold = settings.brew_target_g - settings.prestop_offset_g;
+            if (threshold > 0 && get_display_weight() >= threshold) {
+                machine_brew_stop();
+                bbw_stop_fired = true;
+                wlogf("[bbw] threshold %.1fg reached (w=%.1f)\n", threshold,
+                      get_display_weight());
+            }
         }
     }
 
@@ -1774,15 +1833,13 @@ void ui_tick() {
             settings.shot_count++;
             settings.shots_since_clean++;
         }
-        // Arm auto-offset learning only for shots this firmware stopped.
-        if (bbw_stop_fired && scale_connected()) {
-            s_bbw_arm_ms = millis();
-            s_bbw_ref_ms = millis();
-            s_bbw_ref_w  = scale_weight();
-            s_bbw_peak_w = scale_weight();
-        }
     }
-    if (returning_brew && (millis() - brew_end_ms) >= 3000) {
+    // Return to main as soon as the brew ends. The machine's brew flag follows
+    // the physical lever (left = "Brew", right = "Stop" — it does not move
+    // up/down), so this edge IS the user moving the lever to Stop: after a bbw
+    // auto-stop the flag stays set, pump off, until the lever is returned. The
+    // 1 s R-frame debounce in machine_update() is the only delay.
+    if (returning_brew) {
         returning_brew = false;
         settings_save();
         if (cur_screen == UI_TIMER) ui_show_main();

@@ -281,6 +281,9 @@ void mqtt_init() {
     s_client.setServer(mqtt_config_host(), mqtt_config_port());
     s_client.setCallback(on_msg);
     s_client.setBufferSize(512);
+    // Cap PubSubClient's blocking socket reads at 1 s. Its default 15 s CONNACK/
+    // read timeout can freeze loop() (and the shot timer) if the broker stalls.
+    s_client.setSocketTimeout(1);
 }
 
 void mqtt_tick() {
@@ -310,9 +313,25 @@ void mqtt_tick() {
         return;
     }
 
-    s_client.loop();
+    s_client.loop();   // cheap keep-alive; safe to run even mid-shot
 
-    static uint32_t s_last_state = 0;
+    // Suspend periodic publishes during an active shot: publish_state() serialises
+    // a ~450-byte frame and can block on a slow broker, jittering the shot timer.
+    // s_client.loop() above keeps the connection alive; we just skip the writes.
+    // Publish once immediately after the shot ends to catch the state back up.
+    static bool     s_was_brewing = false;
+    static uint32_t s_last_state  = 0;
+    if (machine.brew_active) {
+        s_was_brewing = true;
+        return;
+    }
+    if (s_was_brewing) {
+        s_was_brewing = false;
+        s_last_state  = millis();
+        publish_state();   // immediate catch-up after the shot
+        return;
+    }
+
     if (millis() - s_last_state >= 2000) {
         s_last_state = millis();
         publish_state();

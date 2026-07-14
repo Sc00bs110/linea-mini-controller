@@ -105,13 +105,20 @@ client.on_message = on_message
 client.connect(MQTT_HOST, MQTT_PORT, 30)
 client.subscribe(AVAIL_TOPIC)
 client.loop_start()
-client.publish(CMD_TOPIC, "PRESS" if use_press else url)
-print(f"[mqtt] trigger published to {CMD_TOPIC}"
+# Retained: the device's MQTT link can flap (BLE scan / WiFi coexistence), and a
+# plain QoS0 publish is lost if it lands in a reconnect gap. A retained message
+# is delivered by the broker the moment the device (re)subscribes. Cleared right
+# after the fetch so the post-flash reconnect can't re-trigger the OTA.
+client.publish(CMD_TOPIC, "PRESS" if use_press else url,
+               retain=True).wait_for_publish()
+print(f"[mqtt] retained trigger published to {CMD_TOPIC}"
       + (" (PRESS -> device default URL)" if use_press else ""))
 
 deadline = time.time() + TIMEOUT_S
-if not fetched.wait(60):
-    sys.exit("device never fetched the image within 60 s — is it online? "
+got_fetch = fetched.wait(120)
+client.publish(CMD_TOPIC, b"", retain=True).wait_for_publish()  # clear retained
+if not got_fetch:
+    sys.exit("device never fetched the image within 120 s — is it online? "
              "Is inbound TCP 8070 allowed through the Windows firewall?")
 if back_online.wait(deadline - time.time()):
     print("SUCCESS: device flashed and reported back online")

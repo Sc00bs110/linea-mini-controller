@@ -95,21 +95,25 @@ static void evict_if_needed() {
     }
 }
 
-// Serialise the just-finished shot to LittleFS as /shots/<id>.json.
-static void write_shot(uint32_t id, uint32_t duration_ms) {
+// Serialise a finished shot to LittleFS as /shots/<id>.json. Takes the shot data
+// explicitly (rather than reading the live recording statics) so a deferred write
+// uses the snapshot captured at brew end, unaffected by a subsequent new shot.
+static void write_shot_data(uint32_t id, uint32_t duration_ms,
+                            float start_temp, float end_temp, bool preinfusion,
+                            const std::vector<Sample>& samples) {
     evict_if_needed();
 
     String json = "{";
     json += "\"id\":" + String((unsigned)id) + ",";
     json += "\"duration_ms\":" + String((unsigned)duration_ms) + ",";
-    json += "\"start_temp\":" + String(s_start_temp, 1) + ",";
-    json += "\"end_temp\":" + String(s_last_temp, 1) + ",";
-    json += "\"preinfusion\":" + String(s_preinfusion ? "true" : "false") + ",";
+    json += "\"start_temp\":" + String(start_temp, 1) + ",";
+    json += "\"end_temp\":" + String(end_temp, 1) + ",";
+    json += "\"preinfusion\":" + String(preinfusion ? "true" : "false") + ",";
     json += "\"samples\":[";
-    for (size_t i = 0; i < s_samples.size(); i++) {
+    for (size_t i = 0; i < samples.size(); i++) {
         if (i) json += ",";
-        json += "{\"t\":" + String((unsigned)s_samples[i].t_ms) +
-                ",\"temp\":" + String(s_samples[i].temp, 1) + "}";
+        json += "{\"t\":" + String((unsigned)samples[i].t_ms) +
+                ",\"temp\":" + String(samples[i].temp, 1) + "}";
     }
     json += "]}";
 
@@ -128,7 +132,39 @@ static void write_shot(uint32_t id, uint32_t duration_ms) {
     }
     s_count++;
     wlogf("[shot] saved %s (%u ms, %u samples)\n",
-          path.c_str(), (unsigned)duration_ms, (unsigned)s_samples.size());
+          path.c_str(), (unsigned)duration_ms, (unsigned)samples.size());
+}
+
+// ─── Deferred end-of-shot write ─────────────────────────────────────────────────
+// write_shot_data() does blocking LittleFS work (evict + String serialisation +
+// file write) that, run synchronously at brew end, stalls loop() right as the UI
+// animates its return to Main. Defer it: snapshot the finished shot here and flush
+// it SHOT_WRITE_DEFER_MS later (after the UI's 3 s return), still from loop() via
+// shot_log_update() — no extra task. A new shot flushes any pending write first so
+// nothing is ever dropped.
+static const uint32_t SHOT_WRITE_DEFER_MS = 4000;
+
+struct PendingShot {
+    bool                active      = false;
+    uint32_t            due_ms      = 0;
+    uint32_t            id          = 0;
+    uint32_t            duration_ms = 0;
+    float               start_temp  = 0.0f;
+    float               end_temp    = 0.0f;
+    bool                preinfusion = false;
+    std::vector<Sample> samples;
+};
+static PendingShot s_pending;
+
+// Write out a deferred shot now (if any) and clear the pending slot.
+static void flush_pending_shot() {
+    if (!s_pending.active) return;
+    s_pending.active = false;
+    write_shot_data(s_pending.id, s_pending.duration_ms,
+                    s_pending.start_temp, s_pending.end_temp,
+                    s_pending.preinfusion, s_pending.samples);
+    s_pending.samples.clear();
+    s_pending.samples.shrink_to_fit();   // release the sample buffer heap
 }
 
 // ─── Shot lifecycle ───────────────────────────────────────────────────────────
@@ -176,8 +212,19 @@ static void end_shot() {
         s_samples.clear();
         return;
     }
-    write_shot(s_shot_start, duration);
-    s_samples.clear();
+    // Defer the blocking filesystem write so it doesn't stall loop() at brew end.
+    // Snapshot the shot into the pending slot; shot_log_update() flushes it once
+    // due. flush first so a still-pending prior shot is never dropped.
+    flush_pending_shot();
+    s_pending.active      = true;
+    s_pending.due_ms      = millis() + SHOT_WRITE_DEFER_MS;
+    s_pending.id          = s_shot_start;
+    s_pending.duration_ms = duration;
+    s_pending.start_temp  = s_start_temp;
+    s_pending.end_temp    = s_last_temp;
+    s_pending.preinfusion = s_preinfusion;
+    s_pending.samples     = std::move(s_samples);
+    s_samples.clear();   // s_samples is valid-but-unspecified after the move
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -199,6 +246,9 @@ void shot_log_update() {
     s_brewing = machine.brew_active;
 
     if (s_brewing && !s_prev_brew) {
+        // A new shot supersedes any deferred write — flush it before reusing the
+        // recording buffers so its data is never lost.
+        flush_pending_shot();
         begin_shot();
     } else if (s_brewing) {
         // Sample once per loop while brewing; frame cadence is set upstream.
@@ -208,6 +258,12 @@ void shot_log_update() {
     }
 
     s_prev_brew = s_brewing;
+
+    // Service the deferred end-of-shot write once its delay elapses. Signed
+    // comparison tolerates millis() wraparound.
+    if (s_pending.active && (int32_t)(millis() - s_pending.due_ms) >= 0) {
+        flush_pending_shot();
+    }
 }
 
 String shot_log_list_json(int limit) {

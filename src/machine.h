@@ -42,5 +42,5 @@ void machine_set_preinfusion_dur(uint8_t v); // 0x00E2: 0x14=20 (unit TBD, app r
 void machine_clean_start();
 void machine_clean_stop();
 bool machine_clean_active();
-bool machine_clean_ready();   // burst done — lever may be lifted now
-void machine_brew_stop();                    // standby+wake: confirmed empirically 2026-06-25
+bool machine_clean_ready();   // burst done — lever may go to Brew now
+void machine_brew_stop();                    // immediate standby-toggle stop (0x8000 rejected by GICAR)
