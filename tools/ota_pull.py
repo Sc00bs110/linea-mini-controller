@@ -64,12 +64,28 @@ class BinHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         data = bin_path.read_bytes()
+        # Small SO_SNDBUF so writes pace with the device's real consumption —
+        # with the default buffer, Windows swallows the whole 1.8 MB instantly
+        # and "served" lies about a transfer the device later abandons at 5%
+        # (diagnosed 2026-07-15: device drains at 3-8 KB/s on a degraded link).
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
-        print(f"served {len(data)} bytes to {self.client_address[0]}")
+        sent = 0
+        t0 = time.time()
+        try:
+            while sent < len(data):
+                self.wfile.write(data[sent:sent + 8192])
+                sent += 8192
+            self.wfile.flush()
+        except OSError as e:
+            print(f"transfer died at {min(sent, len(data)) * 100 // len(data)}% "
+                  f"after {time.time() - t0:.0f}s: {e} — device reboots and can retry")
+            return
+        print(f"served {len(data)} bytes to {self.client_address[0]} "
+              f"in {time.time() - t0:.0f}s")
         fetched.set()
 
     def log_message(self, *args):  # quiet default request logging
@@ -114,8 +130,11 @@ client.publish(CMD_TOPIC, "PRESS" if use_press else url,
 print(f"[mqtt] retained trigger published to {CMD_TOPIC}"
       + (" (PRESS -> device default URL)" if use_press else ""))
 
-deadline = time.time() + TIMEOUT_S
-got_fetch = fetched.wait(120)
+# Wait long enough for a slow-link crawl: the device drains as slowly as
+# ~4 KB/s on a degraded WiFi day (~8 min for the image). The retained trigger
+# also means a failed device attempt reboots and re-fetches by itself.
+got_fetch = fetched.wait(600)
+deadline = time.time() + TIMEOUT_S   # back-online window starts after the fetch
 client.publish(CMD_TOPIC, b"", retain=True).wait_for_publish()  # clear retained
 if not got_fetch:
     sys.exit("device never fetched the image within 120 s — is it online? "

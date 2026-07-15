@@ -12,7 +12,10 @@ import socket, hashlib, os, sys, time
 ESP = sys.argv[1] if len(sys.argv) > 1 else "linea-mini-c6.local"
 FILE = sys.argv[2] if len(sys.argv) > 2 else \
     os.path.join(os.path.dirname(__file__), "..", ".pio", "build", "lm_controller", "firmware.bin")
-PORT, HOST_PORT = 3232, 43231
+# HOST_PORT default 8070 — reuses the "LineaMini OTA pull (TCP 8070)" Windows
+# firewall rule; 43231 had no rule and the device's connect-back was dropped.
+PORT = 3232
+HOST_PORT = int(os.environ.get("OTA_HOST_PORT", "8070"))
 
 size = os.path.getsize(FILE)
 md5 = hashlib.md5(open(FILE, "rb").read()).hexdigest()

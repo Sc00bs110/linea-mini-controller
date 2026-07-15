@@ -20,6 +20,10 @@ struct Settings {
     uint16_t sched_wake_min;      // e.g. 390 = 06:30
     uint16_t sched_sleep_min;     // e.g. 1200 = 20:00
     int16_t  tz_offset_min;       // local time = UTC + this; settings-menu item
+
+    // Scale BLE radio (v0.34): user toggle to disable the NimBLE scale client
+    // entirely. OFF parks the scale task (no scanning) and drops any live link.
+    bool     scale_ble_enabled;
 };
 
 extern Settings settings;

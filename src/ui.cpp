@@ -49,6 +49,7 @@ enum SettingsItem {
     SI_SCHEDULE,     // 3  navigate → standby schedule screen
     SI_TIMEZONE,     // 4  UTC offset, ±30 min steps
     SI_PRESTOP,      // 5  0.0–8.0 g, step 0.5 g
+    SI_SCALE_BT,     //    ON / OFF — scale Bluetooth radio enable
     SI_STEAM,        // 6  ON / OFF
     SI_WIFI,         // 7  navigate → WiFi status screen
     SI_CLEAN_INT,    // 8  shots between cleaning cycles, 10..100 step 5
@@ -68,6 +69,7 @@ static const char *item_names[SI_COUNT] = {
     "Schedule",
     "Timezone",
     "Pre-stop offset",
+    "Scale BT",
     "Steam",
     "WiFi",
     "Clean interval",
@@ -130,10 +132,10 @@ static void demo_update() {
 // ─── MAIN SCREEN ──────────────────────────────────────────────────────────────
 
 static lv_obj_t *lbl_temp;
-static lv_obj_t *obj_steam;
-static lv_obj_t *lbl_steam;
-static lv_obj_t *obj_heat;    // top-left pill, lit while the boiler element is on
-static lv_obj_t *lbl_heat;
+static lv_obj_t *dot_heat;    // top-left indicator dot, lit while the boiler element is on
+static lv_obj_t *dot_steam;   // top-left indicator dot, lit while steam is active
+static lv_obj_t *obj_scale;   // top-right pill: scale link state + tap-to-reconnect
+static lv_obj_t *lbl_scale;
 static lv_obj_t *lbl_brew;
 static lv_obj_t *lbl_shots;
 static lv_obj_t *lbl_scale_weight;
@@ -178,6 +180,7 @@ static uint32_t s_clean_press_ms = 0;
 
 // STANDBY hold-to-sleep state (see ui_tick()).
 static uint32_t s_standby_press_ms = 0;
+static lv_obj_t *obj_standby_confirm;   // yes/no overlay opened by the 2 s hold
 
 static void target_show() {
     char buf[12];
@@ -253,6 +256,17 @@ static void standby_click_cb(lv_event_t *e) {
     }
 }
 
+static void standby_confirm_yes_cb(lv_event_t *e) {
+    lv_obj_add_flag(obj_standby_confirm, LV_OBJ_FLAG_HIDDEN);
+    machine_set_standby(true);
+    wlogf("[ui] standby button: sleep (confirmed)\n");
+}
+
+static void standby_confirm_no_cb(lv_event_t *e) {
+    lv_obj_add_flag(obj_standby_confirm, LV_OBJ_FLAG_HIDDEN);
+    wlogf("[ui] standby button: cancelled\n");
+}
+
 static void clean_overlay_click(lv_event_t *e) {
     switch (s_clean_stage) {
         case CLEAN_PREP:
@@ -284,6 +298,22 @@ static void clean_stop_btn_cb(lv_event_t *e) {
     clean_show_done("Cleaning stopped");
 }
 
+// SCALE pill tap: when connected, do nothing (the pill is status-only). When
+// disconnected, force an immediate reconnect attempt. If the BT radio toggle is
+// off, turn it on and persist (scale_set_enabled re-opens the fast-scan window);
+// if already on, kick the scale task's inter-scan pause so it re-scans within ~1 s.
+static void scale_pill_cb(lv_event_t *e) {
+    if (scale_connected()) return;   // connected → status-only, no action
+    wlogf("[scale] manual connect kick from UI\n");
+    if (!settings.scale_ble_enabled) {
+        settings.scale_ble_enabled = true;
+        settings_save();
+        scale_set_enabled(true);     // logs + opens the fast-scan reconnect window
+    } else {
+        scale_kick_fast_scan();      // already enabled → wake the paused scan loop
+    }
+}
+
 static void ui_main_create() {
     scr_main = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_main, lv_color_black(), 0);
@@ -295,37 +325,7 @@ static void ui_main_create() {
     lv_label_set_text(lbl_temp, "--.-\xc2\xb0" "C");
     lv_obj_set_style_text_font(lbl_temp, &lv_font_lm72_bold, 0);
     lv_obj_set_style_text_color(lbl_temp, lv_color_make(0xD4, 0x89, 0x1A), 0);
-    lv_obj_align(lbl_temp, LV_ALIGN_TOP_MID, 0, 44);
-
-    obj_steam = lv_obj_create(scr_main);
-    lv_obj_set_size(obj_steam, 120, 32);
-    lv_obj_align(obj_steam, LV_ALIGN_TOP_RIGHT, -8, 8);
-    lv_obj_set_style_radius(obj_steam, 16, 0);
-    lv_obj_set_style_border_width(obj_steam, 0, 0);
-    lv_obj_set_style_bg_color(obj_steam, lv_color_make(0x28, 0x28, 0x28), 0);
-    lv_obj_set_style_pad_all(obj_steam, 0, 0);
-    lv_obj_clear_flag(obj_steam, LV_OBJ_FLAG_SCROLLABLE);
-    lbl_steam = lv_label_create(obj_steam);
-    lv_label_set_text(lbl_steam, "STEAM");
-    lv_obj_set_style_text_font(lbl_steam, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_steam, lv_color_make(0x70, 0x70, 0x70), 0);
-    lv_obj_align(lbl_steam, LV_ALIGN_CENTER, 0, 0);
-
-    // HEAT: mirrors the STEAM pill on the left edge; lit while the machine
-    // reports the boiler heating element active (boiler_flags bit 0).
-    obj_heat = lv_obj_create(scr_main);
-    lv_obj_set_size(obj_heat, 120, 32);
-    lv_obj_align(obj_heat, LV_ALIGN_TOP_LEFT, 8, 8);
-    lv_obj_set_style_radius(obj_heat, 16, 0);
-    lv_obj_set_style_border_width(obj_heat, 0, 0);
-    lv_obj_set_style_bg_color(obj_heat, lv_color_make(0x28, 0x28, 0x28), 0);
-    lv_obj_set_style_pad_all(obj_heat, 0, 0);
-    lv_obj_clear_flag(obj_heat, LV_OBJ_FLAG_SCROLLABLE);
-    lbl_heat = lv_label_create(obj_heat);
-    lv_label_set_text(lbl_heat, "HEAT");
-    lv_obj_set_style_text_font(lbl_heat, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_heat, lv_color_make(0x70, 0x70, 0x70), 0);
-    lv_obj_align(lbl_heat, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(lbl_temp, LV_ALIGN_CENTER, 0, -30);
 
     lbl_brew = lv_label_create(scr_main);
     lv_label_set_text(lbl_brew, "BREWING");
@@ -338,13 +338,13 @@ static void ui_main_create() {
     lv_label_set_text(lbl_shots, "0 shots");
     lv_obj_set_style_text_font(lbl_shots, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(lbl_shots, lv_color_make(0x80, 0x80, 0x80), 0);
-    lv_obj_align(lbl_shots, LV_ALIGN_CENTER, 0, 52);
+    lv_obj_align(lbl_shots, LV_ALIGN_BOTTOM_MID, 0, -50);
 
     lbl_scale_weight = lv_label_create(scr_main);
     lv_label_set_text(lbl_scale_weight, "");
-    lv_obj_set_style_text_font(lbl_scale_weight, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(lbl_scale_weight, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(lbl_scale_weight, lv_color_make(0x3A, 0x80, 0x3A), 0);
-    lv_obj_align(lbl_scale_weight, LV_ALIGN_CENTER, 0, 82);
+    lv_obj_align(lbl_scale_weight, LV_ALIGN_CENTER, 0, 55);
 
     led_status = lv_obj_create(scr_main);
     lv_obj_set_size(led_status, 16, 16);
@@ -397,6 +397,55 @@ static void ui_main_create() {
     make_arrow(LV_SYMBOL_DOWN, settemp_down_cb, LV_ALIGN_LEFT_MID, 8,  64);
     lbl_settemp_val = make_col_val(LV_ALIGN_LEFT_MID, 8);
     settemp_show();
+
+    // SCALE: top-right status pill (moved here from bottom-left). Shows the scale
+    // link state (amber "SCALE" when connected, dim grey when not) and, while
+    // disconnected, taps to force a reconnect (see scale_pill_cb). Sits in the
+    // top-right corner where the old STEAM pill lived (x352-472, y8-40), clear of
+    // the top-centre STANDBY pill (ends x300) and the right-edge adjuster (top y74).
+    obj_scale = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_scale, 120, 32);
+    lv_obj_align(obj_scale, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_set_style_radius(obj_scale, 16, 0);
+    lv_obj_set_style_border_width(obj_scale, 0, 0);
+    lv_obj_set_style_bg_color(obj_scale, lv_color_make(0x28, 0x28, 0x28), 0);
+    lv_obj_set_style_pad_all(obj_scale, 0, 0);
+    lv_obj_clear_flag(obj_scale, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(obj_scale, scale_pill_cb, LV_EVENT_CLICKED, NULL);
+    lbl_scale = lv_label_create(obj_scale);
+    lv_label_set_text(lbl_scale, "SCALE");
+    lv_obj_set_style_text_font(lbl_scale, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_scale, lv_color_make(0x70, 0x70, 0x70), 0);
+    lv_obj_align(lbl_scale, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(lbl_scale, LV_OBJ_FLAG_CLICKABLE);
+
+    // HEAT / STEAM indicator dots: display-only status dots in a left-aligned row
+    // at the top-left corner (dots y8-24, mirroring the SCALE pill's top margin;
+    // the left adjuster column starts lower). Each is a small circle reusing the
+    // led_status dot idiom; it floods to the old pill's active colour (HEAT red,
+    // STEAM orange) and dims to grey when inactive, updated in ui_main_update().
+    // A montserrat_16 label sits to the right of each dot to identify it.
+    // Row spans x~8-170, clear of the STANDBY pill (starts x180).
+    auto make_status_dot = [&](const char* txt, int dot_x_ofs, int lbl_x_ofs) {
+        lv_obj_t *lbl = lv_label_create(scr_main);
+        lv_label_set_text(lbl, txt);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_make(0x70, 0x70, 0x70), 0);
+        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, lbl_x_ofs, 9);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *dot = lv_obj_create(scr_main);
+        lv_obj_set_size(dot, 16, 16);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_make(0x35, 0x35, 0x35), 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_set_style_pad_all(dot, 0, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, dot_x_ofs, 8);
+        return dot;
+    };
+    // Left-aligned row: [heat dot][HEAT lbl]  [steam dot][STEAM lbl].
+    dot_heat  = make_status_dot("HEAT",  8,  30);
+    dot_steam = make_status_dot("STEAM", 90, 112);
 
     // CLEAN: hold 2 s to arm the machine's cleaning cycle (fires in ui_tick()).
     obj_clean = lv_obj_create(scr_main);
@@ -502,7 +551,8 @@ static void ui_main_create() {
     lv_obj_clear_flag(lbl_menu, LV_OBJ_FLAG_CLICKABLE);
 
     // STANDBY: hold 1 s to drop the machine into standby (fires in ui_tick()).
-    // Top-centre between the HEAT and STEAM pills (bottom-centre is MENU's spot).
+    // Top-centre pill; the HEAT/STEAM dots and SCALE pill sit in the top-right
+    // corner (bottom-centre is MENU's spot).
     // Waking is handled by the sleep overlay's tap-anywhere, not this pill.
     obj_standby = lv_obj_create(scr_main);
     lv_obj_set_size(obj_standby, 120, 32);
@@ -522,6 +572,49 @@ static void ui_main_create() {
     lv_obj_set_style_text_color(lbl_standby, lv_color_make(0xCC, 0xCC, 0xCC), 0);
     lv_obj_align(lbl_standby, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(lbl_standby, LV_OBJ_FLAG_CLICKABLE);
+
+    // Standby confirmation: dim full-screen overlay opened by the 2 s hold on
+    // the STANDBY pill; standby is only sent from its YES button.
+    obj_standby_confirm = lv_obj_create(scr_main);
+    lv_obj_set_size(obj_standby_confirm, 480, 320);
+    lv_obj_set_pos(obj_standby_confirm, 0, 0);
+    lv_obj_set_style_bg_color(obj_standby_confirm, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(obj_standby_confirm, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(obj_standby_confirm, 0, 0);
+    lv_obj_set_style_radius(obj_standby_confirm, 0, 0);
+    lv_obj_set_style_pad_all(obj_standby_confirm, 0, 0);
+    lv_obj_clear_flag(obj_standby_confirm, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(obj_standby_confirm, LV_OBJ_FLAG_HIDDEN);
+    {
+        lv_obj_t *q = lv_label_create(obj_standby_confirm);
+        lv_label_set_text(q, "Put the machine in standby?");
+        lv_obj_set_style_text_font(q, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(q, lv_color_white(), 0);
+        lv_obj_align(q, LV_ALIGN_CENTER, 0, -50);
+
+        auto make_confirm_btn = [&](const char* txt, lv_event_cb_t cb, int x_ofs,
+                                    lv_color_t bg, lv_color_t fg) {
+            lv_obj_t *btn = lv_obj_create(obj_standby_confirm);
+            lv_obj_set_size(btn, 140, 56);
+            lv_obj_align(btn, LV_ALIGN_CENTER, x_ofs, 40);
+            lv_obj_set_style_radius(btn, 28, 0);
+            lv_obj_set_style_border_width(btn, 0, 0);
+            lv_obj_set_style_bg_color(btn, bg, 0);
+            lv_obj_set_style_pad_all(btn, 0, 0);
+            lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_t *l = lv_label_create(btn);
+            lv_label_set_text(l, txt);
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+            lv_obj_set_style_text_color(l, fg, 0);
+            lv_obj_align(l, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE);
+        };
+        make_confirm_btn("YES", standby_confirm_yes_cb, -90,
+                         lv_color_make(0xD4, 0x89, 0x1A), lv_color_black());
+        make_confirm_btn("NO",  standby_confirm_no_cb,   90,
+                         lv_color_make(0x28, 0x28, 0x28), lv_color_make(0xCC, 0xCC, 0xCC));
+    }
 
     // Sleeping cover: shown while machine.standby is set (schedule or HA).
     // Created last so it sits above every other main-screen widget.
@@ -550,10 +643,6 @@ static void ui_main_create() {
     lv_obj_align(lbl_sleep_sub, LV_ALIGN_CENTER, 0, 24);
     lv_obj_clear_flag(lbl_sleep_sub, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_clear_flag(obj_steam,        LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(lbl_steam,        LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(obj_heat,         LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(lbl_heat,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_temp,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_brew,         LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_shots,        LV_OBJ_FLAG_CLICKABLE);
@@ -573,17 +662,22 @@ static void ui_main_update() {
     }
     lv_label_set_text(lbl_temp, tbuf);
 
+    // HEAT / STEAM indicator dots: flood to the active colour (STEAM orange, HEAT
+    // red) or dim grey when inactive. Same state sources as the old pills.
     bool steam = machine.connected ? machine.steam_active : settings.steam_on;
-    lv_obj_set_style_bg_color(obj_steam,
-        steam ? lv_color_make(0xFF, 0x70, 0x43) : lv_color_make(0x28, 0x28, 0x28), 0);
-    lv_obj_set_style_text_color(lbl_steam,
-        steam ? lv_color_white() : lv_color_make(0x70, 0x70, 0x70), 0);
+    lv_obj_set_style_bg_color(dot_steam,
+        steam ? lv_color_make(0xFF, 0x70, 0x43) : lv_color_make(0x35, 0x35, 0x35), 0);
 
     bool heat = machine.connected && machine.heating_element;
-    lv_obj_set_style_bg_color(obj_heat,
-        heat ? lv_color_make(0xE5, 0x39, 0x35) : lv_color_make(0x28, 0x28, 0x28), 0);
-    lv_obj_set_style_text_color(lbl_heat,
-        heat ? lv_color_white() : lv_color_make(0x70, 0x70, 0x70), 0);
+    lv_obj_set_style_bg_color(dot_heat,
+        heat ? lv_color_make(0xE5, 0x39, 0x35) : lv_color_make(0x35, 0x35, 0x35), 0);
+
+    // SCALE pill: subtle amber text when a scale is linked, dim grey otherwise.
+    // Background stays dark in both states — kept understated vs. the HEAT/STEAM
+    // pills that flood-fill when active (see scale_pill_cb for the tap action).
+    bool scale_up = scale_connected();
+    lv_obj_set_style_text_color(lbl_scale,
+        scale_up ? lv_color_make(0xD4, 0x89, 0x1A) : lv_color_make(0x70, 0x70, 0x70), 0);
 
     // STANDBY pill: WAKE + amber while in standby; else grey "STANDBY". Skip the
     // awake repaint while a hold is in progress so the amber press feedback shows.
@@ -867,6 +961,8 @@ static const char* get_item_val(int i) {
             snprintf(buf, sizeof(buf), "%.0f g", settings.brew_target_g); break;
         case SI_PRESTOP:
             snprintf(buf, sizeof(buf), "%.1f g", settings.prestop_offset_g); break;
+        case SI_SCALE_BT:
+            snprintf(buf, sizeof(buf), "%s", settings.scale_ble_enabled ? "ON" : "OFF"); break;
         case SI_CLEAN_INT:
             snprintf(buf, sizeof(buf), "%u shots", settings.clean_interval); break;
 #if defined(FEATURE_GH_OTA)
@@ -1088,6 +1184,9 @@ static void settings_edit_increment() {
         case SI_STEAM:
             settings.steam_on = !settings.steam_on;
             break;
+        case SI_SCALE_BT:
+            settings.scale_ble_enabled = !settings.scale_ble_enabled;
+            break;
         case SI_STANDBY:
             if      (settings.standby_min == 0)  settings.standby_min = 15;
             else if (settings.standby_min == 15) settings.standby_min = 30;
@@ -1119,6 +1218,7 @@ static void settings_edit_confirm() {
     settings_edit = false;
     settings_save();
     if (settings_sel == SI_STEAM) machine_set_steam(settings.steam_on);
+    if (settings_sel == SI_SCALE_BT) scale_set_enabled(settings.scale_ble_enabled);
     if (settings_sel == SI_TIMEZONE)  // re-apply the SNTP offset immediately
         configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
     settings_draw();
@@ -1128,6 +1228,7 @@ static void settings_edit_confirm() {
 // ↵ nav button; the physical-button flow reaches these via settings_edit_confirm).
 static void settings_apply_item(int idx) {
     if (idx == SI_STEAM) machine_set_steam(settings.steam_on);
+    if (idx == SI_SCALE_BT) scale_set_enabled(settings.scale_ble_enabled);
     if (idx == SI_TIMEZONE)
         configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
 }
@@ -1683,15 +1784,16 @@ void ui_tick() {
         wlogf("[ui] clean cycle armed (2s hold)\n");
     }
 
-    // STANDBY hold-to-sleep: fires once the pill has been held for 1 s. Never
-    // drops the machine into standby mid-shot or mid-cleaning-cycle.
-    if (s_standby_press_ms != 0 && millis() - s_standby_press_ms >= 1000 &&
+    // STANDBY hold-to-sleep: a 2 s hold opens the yes/no confirmation overlay;
+    // standby itself is only sent from the overlay's YES button. Never offered
+    // mid-shot or mid-cleaning-cycle.
+    if (s_standby_press_ms != 0 && millis() - s_standby_press_ms >= 2000 &&
         !brew_now && !machine_clean_active()) {
         s_standby_press_ms = 0;
         lv_obj_set_style_bg_color(obj_standby, lv_color_make(0x28, 0x28, 0x28), 0);
         lv_obj_set_style_text_color(lbl_standby, lv_color_make(0xCC, 0xCC, 0xCC), 0);
-        machine_set_standby(true);
-        wlogf("[ui] standby button: sleep\n");
+        lv_obj_clear_flag(obj_standby_confirm, LV_OBJ_FLAG_HIDDEN);
+        wlogf("[ui] standby button: confirm shown (2s hold)\n");
     }
 
     // ── Standby schedule: fire once at each sleep/wake edge ─────────────────────

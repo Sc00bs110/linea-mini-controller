@@ -1,5 +1,6 @@
 #include "scale.h"
 #include "machine.h"
+#include "settings.h"
 #include "wlog.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -46,9 +47,15 @@ static bool          s_found = false;
 static bool          s_scale_ever_connected = false;
 static uint32_t      s_last_disconnect_ms   = 0;    // millis() of last link drop (0 = none)
 static const uint32_t SCAN_FAST_MS          = 2000;  // no-scale pause while a scale is expected
-static const uint32_t SCAN_RELAXED_MS       = 15000; // no-scale pause once idle (WiFi protection)
+static const uint32_t SCAN_RELAXED_MS       = 60000; // no-scale pause once idle (WiFi protection)
+// 60 s: each scan itself runs 10 s, so a 15 s pause meant ~40% BLE radio duty at
+// idle — enough to degrade WiFi/MQTT within minutes (observed 2026-07-15).
 static const uint32_t RECONNECT_FAST_WIN_MS = 60000; // fast-scan window after a disconnect
 static volatile bool s_ota_hold = false;  // set from the OTA task (see scale.h)
+// Set by scale_kick_fast_scan() (UI pill, loop core), consumed by the scale
+// task's inter-scan pause loop so a manual reconnect cuts the relaxed 60 s wait
+// short and re-scans within one ~500 ms slice. Volatile: cross-task flag.
+static volatile bool s_scan_kick = false;
 // True only while the scale task is parked at its gate (no NimBLE calls in
 // flight). scale_radio_release() waits for this before NimBLEDevice::deinit(),
 // making the cross-task deinit race-free.
@@ -271,9 +278,16 @@ static void scale_ble_task(void*) {
         // connected to a scale): nobody brews on a sleeping machine, and
         // continuous scanning degrades WiFi/MQTT overnight (observed
         // 2026-07-14: OTA triggers lost to MQTT reconnect churn).
-        if (machine.brew_active || s_ota_hold || machine.standby) {
+        // Also park when the user has disabled the scale radio (settings toggle):
+        // no scanning at all until it is switched back on. A scale that was
+        // connected when the toggle went OFF is dropped by the "Stay connected"
+        // loop below (which also gates on settings.scale_ble_enabled), so the
+        // task arrives here already disconnected and simply waits.
+        if (machine.brew_active || s_ota_hold || machine.standby ||
+            !settings.scale_ble_enabled) {
             s_ble_parked = true;
-            while (machine.brew_active || s_ota_hold || machine.standby)
+            while (machine.brew_active || s_ota_hold || machine.standby ||
+                   !settings.scale_ble_enabled)
                 vTaskDelay(pdMS_TO_TICKS(500));
             s_ble_parked = false;
         }
@@ -315,12 +329,27 @@ static void scale_ble_task(void*) {
             // scaleless machine doesn't scan at ~83% duty forever (which would
             // thrash the shared radio the relaxed cadence exists to protect); and
             // fast for a window after any disconnect for quick reconnection.
-            bool since_boot_fast = !s_scale_ever_connected &&
-                                   millis() < RECONNECT_FAST_WIN_MS;
-            bool since_drop_fast = s_last_disconnect_ms != 0 &&
-                                   millis() - s_last_disconnect_ms < RECONNECT_FAST_WIN_MS;
-            bool fast = since_boot_fast || since_drop_fast;
-            vTaskDelay(pdMS_TO_TICKS(fast ? SCAN_FAST_MS : SCAN_RELAXED_MS));
+            // Sliced pause (500 ms slices) rather than one blocking vTaskDelay so
+            // a UI reconnect kick (scale_kick_fast_scan) takes effect within ~1 s
+            // even during the 60 s relaxed wait — a single long delay could not be
+            // interrupted. Recompute the target each slice so an expiring fast
+            // window naturally lengthens the remaining wait. Also break promptly if
+            // a park condition appears so the gate at the top of the loop is honored.
+            uint32_t pause_start = millis();
+            for (;;) {
+                if (s_scan_kick) { s_scan_kick = false; break; }
+                if (machine.brew_active || s_ota_hold || machine.standby ||
+                    !settings.scale_ble_enabled)
+                    break;
+                bool since_boot_fast = !s_scale_ever_connected &&
+                                       millis() < RECONNECT_FAST_WIN_MS;
+                bool since_drop_fast = s_last_disconnect_ms != 0 &&
+                                       millis() - s_last_disconnect_ms < RECONNECT_FAST_WIN_MS;
+                bool fast = since_boot_fast || since_drop_fast;
+                if (millis() - pause_start >= (fast ? SCAN_FAST_MS : SCAN_RELAXED_MS))
+                    break;
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
             continue;
         }
 
@@ -366,7 +395,10 @@ static void scale_ble_task(void*) {
         // ── Stay connected ───────────────────────────────────────────────────
         // Break on s_ota_hold so an OTA radio release can proceed: the loop exits,
         // the client is cleaned up below, and the task parks at the gate.
-        while (pClient->isConnected() && !s_ota_hold) {
+        // Break on !settings.scale_ble_enabled too: turning the toggle OFF while
+        // connected drops the link here (cleanup below issues a clean disconnect
+        // via deleteClient), then the task parks at the gate above.
+        while (pClient->isConnected() && !s_ota_hold && settings.scale_ble_enabled) {
             // Drain pending command queue (Bookoo only)
             if (s_target_model == SCALE_BOOKOO_THEMIS) {
                 uint8_t cmd = s_bookoo_pending_cmd;
@@ -442,6 +474,27 @@ const char* scale_model_name() {
         case SCALE_BOOKOO_THEMIS:   return "Bookoo Themis Ultra";
         default:                    return "—";
     }
+}
+
+// User flipped the settings toggle. The scale task reads settings.scale_ble_enabled
+// directly on its own poll (park gate + stay-connected loop), so this only handles
+// the side-effects: log the change, and on re-enable open the fast-scan window so a
+// scale reconnects quickly even if it has been off longer than RECONNECT_FAST_WIN_MS.
+void scale_set_enabled(bool enabled) {
+    if (enabled) {
+        s_last_disconnect_ms = millis();
+        wlogf("[scale] BT enabled by user\n");
+    } else {
+        wlogf("[scale] BT disabled by user\n");
+    }
+}
+
+void scale_kick_fast_scan() {
+    // Open the fast-scan reconnect window (same signal a disconnect raises) and
+    // wake the task's paused inter-scan wait. If the task is parked (brew/OTA/
+    // standby/BT-off) this just pre-arms both; scanning resumes when it unparks.
+    s_last_disconnect_ms = millis();
+    s_scan_kick          = true;
 }
 
 void scale_set_ota_hold(bool hold) {

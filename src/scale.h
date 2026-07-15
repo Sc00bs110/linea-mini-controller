@@ -33,6 +33,20 @@ float       scale_weight();         // current weight in grams (0.0 if disconnec
 uint32_t    scale_weight_age_ms();
 const char* scale_model_name();     // "Felicita Arc" / "Bookoo Themis Ultra" / "—"
 
+// Apply a change to the user's scale-BT enable toggle. The scale task polls
+// settings.scale_ble_enabled itself (parks when OFF, drops a live link); this
+// logs the change and, on re-enable, re-opens the fast-scan reconnect window.
+void scale_set_enabled(bool enabled);
+
+// Force an immediate reconnect attempt from the UI/loop task (the scale
+// status pill on the main screen). Opens the fast-scan reconnect window
+// (sets s_last_disconnect_ms) AND raises a volatile kick flag so the scale
+// task cuts short any long relaxed inter-scan pause and starts scanning
+// within one ~500 ms slice. No-op effect if the task is parked (brew/OTA/
+// standby/BT-off); it takes effect as soon as the task leaves its gate.
+// Thread-safe: the flag is written here (loop core) and read on the BLE task.
+void scale_kick_fast_scan();
+
 // Suspend/resume BLE scanning while an OTA transfer runs — scanning on the
 // shared 2.4GHz radio stalls the OTA TCP stream (proven live 2026-07-08:
 // transfers died mid-stream exactly while "[scale] scanning" was active).
