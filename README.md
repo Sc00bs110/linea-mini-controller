@@ -99,7 +99,8 @@ release.
 
 Pushing a version tag (`v*`) builds the S3 firmware in GitHub Actions and
 publishes a release with `firmware.bin` and a `version.json` manifest — see
-`.github/workflows/release.yml`.
+`.github/workflows/release.yml`. Version history is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Repository layout
 
