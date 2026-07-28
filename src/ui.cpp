@@ -11,6 +11,7 @@
 #include "version.h"
 #include "wlog.h"
 #include <time.h>
+#include <math.h>   // fabsf() — bbw tare-confirmation check
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -106,6 +107,13 @@ static bool     bbw_stop_fired = false;
 // weight-target stop and the scale-loss failsafe so neither fires on a non-bbw
 // shot (demo, or a real shot with no scale).
 static bool     bbw_armed = false;
+// True once the shot-start tare has been confirmed applied: a weight sample that
+// arrived after this shot started has been observed reading ~0 g. The tare is a
+// QUEUED BLE command (takes a few hundred ms to execute), but the threshold
+// check runs on the same loop pass and every pass after — so an untared cup left
+// on the scale (~500 g) would read >= threshold and stop the shot instantly.
+// Gating the threshold check on this flag prevents that pre-tare false stop.
+static bool     bbw_tared = false;
 
 // ─── Demo mode ────────────────────────────────────────────────────────────────
 static bool     demo_brew       = false;
@@ -141,6 +149,7 @@ static lv_obj_t *lbl_shots;
 static lv_obj_t *lbl_scale_weight;
 static lv_obj_t *led_status;   // connectivity dot: green = WiFi + MQTT up
 static lv_obj_t *lbl_hint;
+static lv_obj_t *lbl_clock;    // wall clock, sits directly above lbl_hint
 static lv_obj_t *obj_sleep_overlay;   // scheduled-standby cover: tap to wake
 static lv_obj_t *lbl_sleep_sub;
 static lv_obj_t *lbl_target_val;
@@ -531,6 +540,14 @@ static void ui_main_create() {
     lv_obj_set_style_text_color(lbl_hint, lv_color_make(0x70, 0x70, 0x70), 0);
     lv_obj_align(lbl_hint, LV_ALIGN_BOTTOM_LEFT, 32, -6);   // right of the status dot
 
+    // Wall clock, stacked directly above the diagnostic line. lbl_hint's font
+    // (montserrat_20) has line_height 22 and its bottom sits 6px up, so it
+    // occupies 6..28px above the bottom edge; -6-24 (= -30) leaves a 2px gap.
+    lbl_clock = lv_label_create(scr_main);
+    lv_label_set_text(lbl_clock, "--:--");
+    lv_obj_set_style_text_font(lbl_clock, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_clock, lv_color_make(0x70, 0x70, 0x70), 0);
+    lv_obj_align(lbl_clock, LV_ALIGN_BOTTOM_LEFT, 32, -6 - 24);
 
     // MENU: bottom-centre box; LONG press opens the settings screen (a plain
     // tap does nothing — replaces the old tap-anywhere-on-screen behaviour).
@@ -649,6 +666,7 @@ static void ui_main_create() {
     lv_obj_clear_flag(lbl_scale_weight, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(led_status,       LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(lbl_hint,         LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(lbl_clock,        LV_OBJ_FLAG_CLICKABLE);
 }
 
 static void ui_main_update() {
@@ -750,6 +768,20 @@ static void ui_main_update() {
         lv_obj_set_style_text_color(lbl_hint, lv_color_make(0xD4, 0x89, 0x1A), 0);
     } else {
         lv_label_set_text(lbl_hint, FW_VERSION);
+    }
+
+    // Wall clock above the diagnostic line. Show "--:--" rather than a stale
+    // value until NTP has actually set the clock (getLocalTime fails while the
+    // year is still 1970), so a wrong schedule edge is never blamed on the UI.
+    {
+        struct tm ti;
+        if (getLocalTime(&ti, 0)) {
+            char clk[8];
+            snprintf(clk, sizeof(clk), "%02d:%02d", ti.tm_hour, ti.tm_min);
+            lv_label_set_text(lbl_clock, clk);
+        } else {
+            lv_label_set_text(lbl_clock, "--:--");
+        }
     }
 
     // Scheduled/commanded standby: cover the screen with the sleeping overlay.
@@ -1823,9 +1855,19 @@ void ui_tick() {
                             wlogf("[sched] sleep %02d:%02d\n", ti.tm_hour, ti.tm_min);
                         }
                     }
-                    if (mod == (int)settings.sched_wake_min && machine.standby) {
-                        machine_set_standby(false);
-                        wlogf("[sched] wake %02d:%02d\n", ti.tm_hour, ti.tm_min);
+                    // Same window+day-key pattern as sleep above: exact-minute
+                    // equality missed the edge whenever the clock jumped over
+                    // that minute (NTP step, or no tick landing inside it).
+                    // Waking has no brew/clean precondition, so no suppression.
+                    int past_wake = (mod - (int)settings.sched_wake_min + 1440) % 1440;
+                    if (past_wake < 15 && machine.standby) {
+                        static uint32_t s_wake_fired_day = 0;
+                        uint32_t day_key = (uint32_t)(ti.tm_yday + 1);
+                        if (s_wake_fired_day != day_key) {
+                            s_wake_fired_day = day_key;
+                            machine_set_standby(false);
+                            wlogf("[sched] wake %02d:%02d\n", ti.tm_hour, ti.tm_min);
+                        }
                     }
                 }
             }
@@ -1886,12 +1928,13 @@ void ui_tick() {
         brew_start_ms  = millis();
         scale_tare_and_start();
         bbw_stop_fired = false;
+        bbw_tared      = false;
         // Brew-by-weight applies to this shot only if a scale is connected at the
         // start (and it's a real shot, not a cleaning-cycle pump phase). Latch it
         // so a mid-shot scale dropout still counts as bbw (the failsafe stops it).
         bbw_armed = scale_connected() && settings.brew_target_g > 0.0f &&
                     !machine_clean_active();
-        wlogf("[bbw] shot start: armed=%d scale=%d target=%.1f offset=%.1f\n",
+        wlogf("[bbw] shot start (tare-gated): armed=%d scale=%d target=%.1f offset=%.1f\n",
               bbw_armed, scale_connected(), settings.brew_target_g,
               settings.prestop_offset_g);
         // During a cleaning cycle the overlay is the UI — no shot timer.
@@ -1915,6 +1958,36 @@ void ui_tick() {
             machine_brew_stop();
             bbw_stop_fired = true;
             wlogf("[bbw] FAILSAFE stop: scale data lost mid-shot\n");
+        } else if (!bbw_tared) {
+            // Gate the threshold stop until the shot-start tare has actually
+            // executed. scale_tare_and_start() only queues the BLE tare (drained
+            // ~200 ms later), so on the first passes get_display_weight() still
+            // returns a STALE pre-tare sample — evaluating the threshold now
+            // would stop the shot at ~0 s.
+            //
+            // A value test alone is not enough: on the 2nd shot of a session the
+            // scale is still zeroed from the previous shot's tare, so the stale
+            // sample already reads near zero and would latch the gate instantly
+            // (also silently defeating the 10 s failsafe below). Require the
+            // sample itself to have arrived AFTER this shot started, and require
+            // a genuine ~0 g reading rather than merely "under 5 g".
+            uint32_t age = scale_weight_age_ms();
+            bool sample_is_post_tare =
+                (age != UINT32_MAX) && (age <= millis() - brew_start_ms);
+            float w = get_display_weight();
+            if (sample_is_post_tare && fabsf(w) < 0.5f) {
+                bbw_tared = true;
+                wlogf("[bbw] tare confirmed (w=%.2f, age=%lums)\n", w,
+                      (unsigned long)age);
+            } else if (millis() - brew_start_ms > 10000) {
+                // Failsafe: if the tare never confirms (queued BLE tare lost),
+                // the threshold stop can never arm — don't let the shot run
+                // blind. Same spirit as the scale-lost failsafe above.
+                machine_brew_stop();
+                bbw_stop_fired = true;
+                wlogf("[bbw] FAILSAFE stop: tare never confirmed (w=%.2f, age=%lums)\n",
+                      w, (unsigned long)age);
+            }
         } else {
             float threshold = settings.brew_target_g - settings.prestop_offset_g;
             if (threshold > 0 && get_display_weight() >= threshold) {

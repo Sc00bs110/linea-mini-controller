@@ -127,6 +127,14 @@ static const char* s_wifi_ssid    = nullptr;
 static const char* s_wifi_pass    = nullptr;
 static uint32_t    s_wifi_retries = 0;   // number of explicit reconnect attempts
 
+// NTP is (re)synced from wifi_tick()'s connected branch, not once at boot: a
+// boot-only sync leaves the clock free-running on the ESP32's RC oscillator,
+// which drifts enough over days to slide the standby schedule off its edges.
+// 0 = never synced this boot (sentinel — millis() is already non-zero here, so
+// a plain elapsed-time test would suppress the very first sync).
+static uint32_t    s_last_ntp_sync_ms = 0;
+static const uint32_t NTP_RESYNC_INTERVAL_MS = 3600000UL;   // 1 h
+
 static void wifi_begin() {
     WiFi.disconnect(false);
     delay(100);
@@ -150,8 +158,8 @@ static void wifi_ota_init() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("WiFi OK — IP: %s\n", WiFi.localIP().toString().c_str());
-        // Local time = UTC + settings offset (settings-menu "Timezone" item).
-        configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
+        // NTP is not started here — wifi_tick() owns the single sync path, so
+        // a connect that lands after this 10s window still gets a clock.
     } else {
         Serial.println("WiFi slow — retrying every 20s via wifi_tick()");
     }
@@ -168,6 +176,18 @@ static void wifi_tick() {
     static uint32_t last_retry = 0;
     if (WiFi.status() == WL_CONNECTED) {
         last_retry = 0;  // reset so we retry quickly after any future disconnect
+
+        // Sync the clock the first time we ever see WiFi up this boot, then
+        // re-sync hourly to bound RC-oscillator drift. Local time = UTC +
+        // settings offset (settings-menu "Timezone" item); no DST handling.
+        bool first_sync = (s_last_ntp_sync_ms == 0);
+        if (first_sync || millis() - s_last_ntp_sync_ms >= NTP_RESYNC_INTERVAL_MS) {
+            s_last_ntp_sync_ms = millis();
+            configTime(settings.tz_offset_min * 60L, 0, "pool.ntp.org", "time.nist.gov");
+            wlogf("[ntp] %s (tz offset %d min)\n",
+                  first_sync ? "first sync" : "periodic resync",
+                  (int)settings.tz_offset_min);
+        }
         return;
     }
     if (millis() - last_retry < 20000) return;

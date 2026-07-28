@@ -22,6 +22,7 @@
 #define MQTT_CMD_CLEAN  MQTT_BASE "/cmd/clean"
 #define MQTT_CMD_STANDBY MQTT_BASE "/cmd/standby"
 #define MQTT_CMD_OTA    MQTT_BASE "/cmd/ota"
+#define MQTT_CMD_PRESTOP MQTT_BASE "/cmd/prestop"
 #define HA_BASE         "homeassistant"
 
 // Default firmware URL used when the ota command payload is "PRESS" (the HA
@@ -77,6 +78,12 @@ static void on_msg(const char* topic, byte* payload, unsigned int len) {
             settings.last_cleaning_epoch = (uint32_t)now;
         settings.shots_since_clean = 0;
         settings_save();
+
+    } else if (strcmp(topic, MQTT_CMD_PRESTOP) == 0) {
+        float g = constrain(atof(val), 0.0f, 8.0f);
+        settings.prestop_offset_g = g;
+        settings_save();
+        wlogf("[mqtt] prestop offset set to %.1f g\n", g);
 
     } else if (strcmp(topic, MQTT_CMD_OTA) == 0) {
         // A full URL triggers a pull from that URL; "PRESS" (the HA button) uses
@@ -176,12 +183,44 @@ static void publish_discovery() {
         "\"dev_cla\":\"temperature\",\"unit_of_meas\":\"\\u00b0C\","
         "\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
 
-    // Learned brew-by-weight pre-stop offset — the machine stops the shot this
-    // many grams before target to allow for post-stop drip.
+    // Brew-by-weight pre-stop offset — the machine stops the shot this many grams
+    // before target to allow for post-stop drip. Settable from HA (cmd/prestop) so
+    // a post-shot automation can tune it against the measured final weight.
     pub_retained(
-        HA_BASE "/sensor/lm_mini/prestop_offset/config",
+        HA_BASE "/number/lm_mini/prestop_offset/config",
         "{\"name\":\"Pre-stop offset\",\"uniq_id\":\"lm_mini_prestop_offset\","
         "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.prestop_offset}}\","
+        "\"cmd_t\":\"" MQTT_CMD_PRESTOP "\","
+        "\"min\":0,\"max\":8,\"step\":0.1,\"unit_of_meas\":\"g\","
+        "\"mode\":\"box\"," AVAIL_J "," DEV_J "}");
+
+    // Delete the stale prestop_offset *sensor* entity from before it became a
+    // number: an empty retained payload on the old discovery topic tells HA to
+    // remove it. pub_retained can't send an empty payload (see below), so publish
+    // directly.
+    s_client.publish(HA_BASE "/sensor/lm_mini/prestop_offset/config", "", true);
+
+    // Live scale reading — the current cup weight during a shot.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/weight/config",
+        "{\"name\":\"Scale Weight\",\"uniq_id\":\"lm_mini_weight\","
+        "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.weight}}\","
+        "\"unit_of_meas\":\"g\",\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
+
+    // Whether a BLE scale is currently linked.
+    pub_retained(
+        HA_BASE "/binary_sensor/lm_mini/scale/config",
+        "{\"name\":\"Scale Connected\",\"uniq_id\":\"lm_mini_scale\","
+        "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.scale}}\","
+        "\"dev_cla\":\"connectivity\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\","
+        AVAIL_J "," DEV_J "}");
+
+    // Brew-by-weight target — the final cup weight the shot aims for. Exposed so a
+    // post-shot automation can compare it against the measured weight.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/brew_target/config",
+        "{\"name\":\"Brew Target\",\"uniq_id\":\"lm_mini_brew_target\","
+        "\"stat_t\":\"" MQTT_STATE "\",\"val_tpl\":\"{{value_json.brew_target}}\","
         "\"unit_of_meas\":\"g\",\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
 
     // Firmware OTA trigger — press publishes "PRESS" to the ota command topic,
@@ -192,7 +231,7 @@ static void publish_discovery() {
         "\"cmd_t\":\"" MQTT_CMD_OTA "\",\"pl_prs\":\"PRESS\","
         AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (13 entities)\n");
+    wlogf("[mqtt] HA discovery published (16 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -214,11 +253,11 @@ static void publish_state() {
     bool in_frame; int rxlen;
     gicar_rx_state(&in_frame, &rxlen);
 
-    char state[448];
+    char state[512];
     snprintf(state, sizeof(state),
         "{\"temp\":%.1f,\"target_temp\":%.1f,\"machine_setpoint\":%.1f,\"brew\":\"%s\","
         "\"steam\":\"%s\",\"standby\":\"%s\",\"shots\":%u,\"shots_since_clean\":%u,\"last_clean\":\"%s\","
-        "\"machine\":\"%s\",\"scale\":\"%s\",\"weight\":%.1f,\"prestop_offset\":%.1f,"
+        "\"machine\":\"%s\",\"scale\":\"%s\",\"weight\":%.1f,\"prestop_offset\":%.1f,\"brew_target\":%.1f,"
         "\"rx\":%lu,\"in_frame\":%d,\"rxlen\":%d,\"dbg\":\"%s\"}",
         machine.coffee_temp_c,
         settings.coffee_temp_c,
@@ -233,6 +272,7 @@ static void publish_state() {
         scale_connected()    ? "ON" : "OFF",
         scale_weight(),
         settings.prestop_offset_g,
+        settings.brew_target_g,
         gicar_rx_total(),
         in_frame ? 1 : 0,
         rxlen,
@@ -267,6 +307,7 @@ static bool do_connect() {
     s_client.subscribe(MQTT_CMD_STANDBY);
     s_client.subscribe(MQTT_CMD_CLEAN);
     s_client.subscribe(MQTT_CMD_OTA);
+    s_client.subscribe(MQTT_CMD_PRESTOP);
     publish_discovery();
     wlogf("[mqtt] connected as %s\n", client_id);
     return true;
@@ -280,7 +321,9 @@ void mqtt_init() {
     if (!mqtt_config_enabled()) return;   // no broker — mqtt_tick() no-ops
     s_client.setServer(mqtt_config_host(), mqtt_config_port());
     s_client.setCallback(on_msg);
-    s_client.setBufferSize(512);
+    // Must cover topic + header + the largest payload: the state JSON is now up
+    // to ~500 bytes, and PubSubClient drops (not truncates) oversized publishes.
+    s_client.setBufferSize(768);
     // Cap PubSubClient's blocking socket reads at 1 s. Its default 15 s CONNACK/
     // read timeout can freeze loop() (and the shot timer) if the broker stalls.
     s_client.setSocketTimeout(1);
