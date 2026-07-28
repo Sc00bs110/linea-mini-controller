@@ -462,6 +462,10 @@ float scale_weight() {
     return scale.weight_g;
 }
 
+float scale_flow() {
+    return scale.flow_gps;
+}
+
 uint32_t scale_weight_age_ms() {
     uint32_t t = scale.last_weight_ms;
     if (t == 0) return UINT32_MAX;   // no weight notify received yet this session

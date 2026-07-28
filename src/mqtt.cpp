@@ -6,6 +6,7 @@
 #include "wlog.h"
 #include "ota_http.h"
 #include "mqtt_config.h"
+#include "flow_log.h"
 #include <PubSubClient.h>
 #include <WiFiClient.h>
 #include <WiFi.h>
@@ -17,6 +18,7 @@
 #define MQTT_BASE       "lm_mini"
 #define MQTT_STATE      MQTT_BASE "/state"
 #define MQTT_AVAIL      MQTT_BASE "/availability"
+#define MQTT_SHOT       MQTT_BASE "/shot"
 #define MQTT_CMD_TEMP   MQTT_BASE "/cmd/temp"
 #define MQTT_CMD_STEAM  MQTT_BASE "/cmd/steam"
 #define MQTT_CMD_CLEAN  MQTT_BASE "/cmd/clean"
@@ -231,7 +233,34 @@ static void publish_discovery() {
         "\"cmd_t\":\"" MQTT_CMD_OTA "\",\"pl_prs\":\"PRESS\","
         AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (16 entities)\n");
+    // ── Per-shot flow curve (retained on MQTT_SHOT, one publish per finished shot) ──
+    //
+    // These three read from MQTT_SHOT rather than MQTT_STATE, so they only change
+    // at brew end and hold their last value in between.
+
+    // Fastest instantaneous flow seen during the shot.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/peak_flow/config",
+        "{\"name\":\"Peak Flow\",\"uniq_id\":\"lm_mini_peak_flow\","
+        "\"stat_t\":\"" MQTT_SHOT "\",\"val_tpl\":\"{{value_json.peak_flow_gps}}\","
+        "\"unit_of_meas\":\"g/s\",\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
+
+    // Final cup weight divided by shot duration.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/avg_flow/config",
+        "{\"name\":\"Average Flow\",\"uniq_id\":\"lm_mini_avg_flow\","
+        "\"stat_t\":\"" MQTT_SHOT "\",\"val_tpl\":\"{{value_json.avg_flow_gps}}\","
+        "\"unit_of_meas\":\"g/s\",\"state_class\":\"measurement\"," AVAIL_J "," DEV_J "}");
+
+    // Carrier for the full curve: the state is the shot duration, while the t/f/w
+    // arrays ride along as entity attributes (json_attr_t) for charting in HA.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/shot_curve/config",
+        "{\"name\":\"Shot Flow Curve\",\"uniq_id\":\"lm_mini_shot_curve\","
+        "\"stat_t\":\"" MQTT_SHOT "\",\"val_tpl\":\"{{value_json.duration_ms}}\","
+        "\"unit_of_meas\":\"ms\",\"json_attr_t\":\"" MQTT_SHOT "\"," AVAIL_J "," DEV_J "}");
+
+    wlogf("[mqtt] HA discovery published (19 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -282,6 +311,19 @@ static void publish_state() {
         wlogf("[mqtt] publish failed — buffer full or disconnected\n");
 }
 
+// ─── Shot-flow publish ────────────────────────────────────────────────────────
+
+// Push a finished shot's flow curve, retained, so HA still has the last shot
+// after a restart. No-op unless flow_log has a curve waiting, so this is safe to
+// call on every periodic tick.
+static void publish_shot_flow() {
+    if (!flow_log_has_pending()) return;
+    String json = flow_log_take_json();
+    if (!s_client.publish(MQTT_SHOT, json.c_str(), true)) {
+        wlogf("[mqtt] shot-flow publish failed (%u bytes)\n", (unsigned)json.length());
+    }
+}
+
 // ─── Connect ──────────────────────────────────────────────────────────────────
 
 static bool do_connect() {
@@ -321,9 +363,11 @@ void mqtt_init() {
     if (!mqtt_config_enabled()) return;   // no broker — mqtt_tick() no-ops
     s_client.setServer(mqtt_config_host(), mqtt_config_port());
     s_client.setCallback(on_msg);
-    // Must cover topic + header + the largest payload: the state JSON is now up
-    // to ~500 bytes, and PubSubClient drops (not truncates) oversized publishes.
-    s_client.setBufferSize(768);
+    // Must cover topic + header + the largest payload, since PubSubClient drops
+    // (not truncates) oversized publishes. The worst case is no longer the ~500
+    // byte state JSON but the per-shot flow curve on MQTT_SHOT: 150 samples of
+    // t/f/w serialised as parallel arrays runs to roughly 3 KB.
+    s_client.setBufferSize(4096);
     // Cap PubSubClient's blocking socket reads at 1 s. Its default 15 s CONNACK/
     // read timeout can freeze loop() (and the shot timer) if the broker stalls.
     s_client.setSocketTimeout(1);
@@ -378,6 +422,14 @@ void mqtt_tick() {
     if (millis() - s_last_state >= 2000) {
         s_last_state = millis();
         publish_state();
+        // Deliberately not in the falling-edge branch above: the ~3 KB curve is a
+        // blocking write, and brew end is exactly the instant shot_log.cpp defers
+        // work away from (the UI is animating its return to Main). Publishing on
+        // the periodic tick also means a curve recorded while the broker was down
+        // survives — mqtt_tick() returns early while disconnected, so the pending
+        // flag holds and the curve goes out on the first tick after reconnect. A
+        // publish that fails on a live connection does drop that shot (logged).
+        publish_shot_flow();
     }
 }
 

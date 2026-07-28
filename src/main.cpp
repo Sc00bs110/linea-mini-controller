@@ -57,6 +57,9 @@
 // LittleFS-backed shot history (start/end detection, temp/weight samples, JSON API).
 #include "shot_log.h"
 
+// RAM-only per-shot flow/weight curve, published to Home Assistant at brew end.
+#include "flow_log.h"
+
 // ── WiFi + OTA ────────────────────────────────────────────────────────────────
 //
 // OTA runs in its own FreeRTOS task (this chip is single-core, so it still
@@ -259,6 +262,7 @@ void loop() {
     // `machine` struct ui.cpp reads (connected/coffee_temp_c/brew_active/...).
     machine_update();
     shot_log_update();
+    flow_log_update();
 
     wifi_tick();
     mqtt_tick();

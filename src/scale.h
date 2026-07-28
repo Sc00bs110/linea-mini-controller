@@ -28,6 +28,7 @@ void  scale_tare_and_start();
 
 bool        scale_connected();
 float       scale_weight();         // current weight in grams (0.0 if disconnected)
+float       scale_flow();           // current flow rate in g/s (0.0 if disconnected) — Bookoo only
 // Milliseconds since the last weight notification (UINT32_MAX if none received
 // yet). Used by the UI's brew-by-weight failsafe to detect a stalled scale feed.
 uint32_t    scale_weight_age_ms();
