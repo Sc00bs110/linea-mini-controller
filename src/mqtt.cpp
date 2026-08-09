@@ -7,6 +7,7 @@
 #include "ota_http.h"
 #include "mqtt_config.h"
 #include "flow_log.h"
+#include "bbw_event.h"
 #include <PubSubClient.h>
 #include <WiFiClient.h>
 #include <WiFi.h>
@@ -19,6 +20,7 @@
 #define MQTT_STATE      MQTT_BASE "/state"
 #define MQTT_AVAIL      MQTT_BASE "/availability"
 #define MQTT_SHOT       MQTT_BASE "/shot"
+#define MQTT_BBW        MQTT_BASE "/bbw"
 #define MQTT_CMD_TEMP   MQTT_BASE "/cmd/temp"
 #define MQTT_CMD_STEAM  MQTT_BASE "/cmd/steam"
 #define MQTT_CMD_CLEAN  MQTT_BASE "/cmd/clean"
@@ -260,7 +262,17 @@ static void publish_discovery() {
         "\"stat_t\":\"" MQTT_SHOT "\",\"val_tpl\":\"{{value_json.duration_ms}}\","
         "\"unit_of_meas\":\"ms\",\"json_attr_t\":\"" MQTT_SHOT "\"," AVAIL_J "," DEV_J "}");
 
-    wlogf("[mqtt] HA discovery published (19 entities)\n");
+    // ── Per-shot brew-by-weight diagnostic record (retained on MQTT_BBW) ────────
+    // State is the stop reason so the history reads as a sequence of outcomes;
+    // everything needed to diagnose a runaway or an early stop (attempts, stop
+    // latency, arm timing, weights) rides along as entity attributes.
+    pub_retained(
+        HA_BASE "/sensor/lm_mini/bbw_last_shot/config",
+        "{\"name\":\"BBW Last Shot\",\"uniq_id\":\"lm_mini_bbw_last_shot\","
+        "\"stat_t\":\"" MQTT_BBW "\",\"val_tpl\":\"{{value_json.stop_reason}}\","
+        "\"json_attr_t\":\"" MQTT_BBW "\"," AVAIL_J "," DEV_J "}");
+
+    wlogf("[mqtt] HA discovery published (20 entities)\n");
 }
 
 // ─── State publish ────────────────────────────────────────────────────────────
@@ -321,6 +333,19 @@ static void publish_shot_flow() {
     String json = flow_log_take_json();
     if (!s_client.publish(MQTT_SHOT, json.c_str(), true)) {
         wlogf("[mqtt] shot-flow publish failed (%u bytes)\n", (unsigned)json.length());
+    }
+}
+
+// ─── Brew-by-weight event publish ─────────────────────────────────────────────
+
+// Push the last shot's bbw diagnostic record, retained, so HA keeps the most
+// recent outcome across restarts. Same pending-flag handshake (and the same
+// no-op-when-empty safety) as publish_shot_flow().
+static void publish_bbw_event() {
+    if (!bbw_event_has_pending()) return;
+    String json = bbw_event_take_json();
+    if (!s_client.publish(MQTT_BBW, json.c_str(), true)) {
+        wlogf("[mqtt] bbw-event publish failed (%u bytes)\n", (unsigned)json.length());
     }
 }
 
@@ -430,6 +455,7 @@ void mqtt_tick() {
         // flag holds and the curve goes out on the first tick after reconnect. A
         // publish that fails on a live connection does drop that shot (logged).
         publish_shot_flow();
+        publish_bbw_event();
     }
 }
 

@@ -10,9 +10,27 @@ MachineState machine = {};
 
 // Pending brew-stop wake: non-zero means send wake command at that millis() value.
 static uint32_t s_brew_stop_wake_ms = 0;
-// Set by machine_brew_stop_standby(); triggers a second wake after the lever
+// Set by send_stop_standby_burst(); triggers a second wake after the lever
 // returns to Stop (the machine queues the mid-brew standby until then).
 static bool s_stop_wake_pending = false;
+
+// ── Supervised brew stop ───────────────────────────────────────────────────────
+// The GICAR never acks a write, so the old fire-and-forget stop had no way to
+// know the burst was swallowed (the controller streams Z-frames at ~600 B/s
+// during a shot and mishandles inbound traffic mid-stream — the documented cause
+// of the ~50% brew-by-weight runaways). The pump flag in the R-frame poll IS the
+// ack: verify it goes false, resend the burst if it doesn't, and only then wake.
+// Note pump_active is raw/undebounced — that is what we want here.
+static const uint32_t STOP_RETRY_MS       = 1800;  // ≥2 R-poll periods (~760 ms each)
+static const uint32_t STOP_CONFIRM_MIN_MS = 800;   // ignore frames polled before the burst
+static const uint8_t  STOP_MAX_ATTEMPTS   = 3;
+
+static bool     s_stop_verifying  = false;  // true between the first burst and confirm/give-up
+static uint32_t s_stop_sent_ms    = 0;      // millis() of the most recent burst
+static uint32_t s_stop_first_ms   = 0;      // millis() of the first burst (latency reference)
+static uint8_t  s_stop_attempts   = 0;      // bursts sent for the current stop
+static uint32_t s_stop_latency_ms = 0;      // first burst → pump-off confirm (0 = never confirmed)
+static bool     s_stop_gave_up    = false;  // attempts exhausted with the pump still running
 
 // Disconnect timeout: mark the machine offline if no R or Z frame arrives within
 // this window. The R-frame poll runs at ~760 ms, so 3 s tolerates a few misses.
@@ -37,17 +55,70 @@ static void gicar_write_byte(uint16_t addr, uint8_t value) {
     gicar_write(addr, &value, 1);
 }
 
-// Standby-toggle brew stop: force standby (0x0000=0x00 + config-sync regs), then
-// wake 500 ms later via the timer in machine_update(). Side effects observed in
-// the field: the group's reheat and the next pull can need a lever cycle when the
-// lever returns during the standby/wake window (a 10 s lever hold after the stop
-// reheated fine, 2026-07-14). This is the only working stop — see machine_brew_stop().
-static void machine_brew_stop_standby() {
+// Standby-toggle brew stop burst: force standby (0x0000=0x00 + config-sync regs).
+// Side effects observed in the field: the group's reheat and the next pull can
+// need a lever cycle when the lever returns during the standby/wake window (a
+// 10 s lever hold after the stop reheated fine, 2026-07-14). This is the only
+// working stop — see machine_brew_stop(). Unlike the pre-v0.42 version this does
+// NOT schedule the wake: the wake is held until the pump is confirmed off (or
+// the retries are exhausted), so a late-applied standby can't be undone by a
+// wake that already went out.
+static void send_stop_standby_burst() {
     gicar_write_byte(0x0000, 0x00);
     for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
-    s_brew_stop_wake_ms = millis() + 500;
+    s_stop_sent_ms      = millis();
     s_stop_wake_pending = true;   // second wake once the lever returns to Stop
-    wlogf("[machine] brew_stop: standby sent, wake in 500ms\n");
+}
+
+// Schedule the wake that undoes the stop's standby. EVERY path out of the
+// verify state machine must call this — the machine must never be left in
+// standby because a stop wasn't confirmed.
+static void schedule_stop_wake() {
+    s_brew_stop_wake_ms = millis() + 500;
+}
+
+// Verify half of the supervised stop — called from the R-frame handler with a
+// FRESH pump reading. The STOP_CONFIRM_MIN_MS guard rejects frames the machine
+// polled before our burst landed: without it a pump that happens to be idle at
+// the moment of the stop (preinfusion pause, or the 10 s arm failsafe firing
+// during one) would "confirm" a stop that was never actually applied.
+static void stop_supervise_frame() {
+    if (!s_stop_verifying) return;
+    if (millis() - s_stop_sent_ms < STOP_CONFIRM_MIN_MS) return;
+    if (machine.pump_active) return;
+
+    s_stop_verifying  = false;
+    s_stop_latency_ms = millis() - s_stop_first_ms;
+    schedule_stop_wake();
+    wlogf("[machine] brew_stop: pump off confirmed after %u ms (%u attempt(s)), wake in 500ms\n",
+          (unsigned)s_stop_latency_ms, (unsigned)s_stop_attempts);
+}
+
+// Timing half — called unconditionally every machine_update() so the state
+// machine still terminates if the R-frame stream dies mid-verify (a stranded
+// standby would leave the machine asleep). Worst case is bounded at
+// STOP_MAX_ATTEMPTS * STOP_RETRY_MS.
+static void stop_supervise_timing() {
+    if (!s_stop_verifying) return;
+    if (millis() - s_stop_sent_ms < STOP_RETRY_MS) return;
+
+    if (s_stop_attempts < STOP_MAX_ATTEMPTS) {
+        s_stop_attempts++;
+        send_stop_standby_burst();
+        wlogf("[machine] brew_stop: pump still on — resend %u/%u\n",
+              (unsigned)s_stop_attempts, (unsigned)STOP_MAX_ATTEMPTS);
+        return;
+    }
+
+    // Exhausted. Wake anyway: a half-toggled machine is worse than a runaway
+    // shot the user can stop with the lever. s_stop_wake_pending is left set so
+    // the lever-return second wake still fires — this is the path that needs it
+    // most.
+    s_stop_verifying = false;
+    s_stop_gave_up   = true;
+    schedule_stop_wake();
+    wlogf("[machine] brew_stop: GAVE UP after %u attempts — pump still running, wake sent\n",
+          (unsigned)s_stop_attempts);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -80,7 +151,7 @@ void machine_update() {
     // Drain Serial1, run the poll cadence, and parse any R/Z frames.
     gicar_process();
 
-    // ── Brew-stop wake: fires 500 ms after machine_brew_stop_standby() ──────────
+    // ── Brew-stop wake: fires 500 ms after the stop was confirmed (or given up) ─
     if (s_brew_stop_wake_ms != 0 && millis() >= s_brew_stop_wake_ms) {
         s_brew_stop_wake_ms = 0;
         gicar_write_byte(0x0000, 0x01);
@@ -103,6 +174,9 @@ void machine_update() {
         machine.last_frame_ms   = millis();
         machine.connected       = true;
 
+        // Fresh pump reading — the only ack the GICAR gives us for a stop.
+        stop_supervise_frame();
+
         if (r_brew) {
             machine.brew_active = true;
             s_brew_false_ms     = 0;
@@ -118,6 +192,13 @@ void machine_update() {
                 // lever return after every bbw stop). The mid-brew wake 500 ms
                 // after the stop is ignored, so send a SECOND wake shortly after
                 // the lever actually returns to undo the queued standby.
+                // Lever returned before the pump-off confirm landed: the shot is
+                // over either way, so stop resending. The pending wake below
+                // still undoes the queued standby.
+                if (s_stop_verifying) {
+                    s_stop_verifying = false;
+                    wlogf("[machine] brew_stop: lever returned before pump-off confirm\n");
+                }
                 if (s_stop_wake_pending) {
                     s_stop_wake_pending  = false;
                     s_brew_stop_wake_ms  = millis() + 500;
@@ -151,6 +232,11 @@ void machine_update() {
             s_brew_false_ms     = 0;
         }
     }
+
+    // ── Supervised stop: retry/give-up timing (runs even with no frames) ────────
+    // After the frame parsing above so a confirm arriving this pass always wins
+    // over a resend that is due on the same pass.
+    stop_supervise_timing();
 
     // ── Clean cycle: 6-pulse burst, then radio silence until the window ends ──
     if (s_clean_until_ms != 0) {
@@ -299,6 +385,33 @@ void machine_set_standby(bool standby) {
 // ~8-10 g of overshoot at test-shot flow rates. The lever machine has no factory
 // remote-stop command; the standby toggle is the only working stop we have.
 // machine.standby is NOT set so the UI stays in "active" state.
+//
+// v0.42: supervised. This call only sends the first burst and arms the verify
+// state machine in machine_update(); the wake follows the pump-off confirm (or
+// the give-up path), never a fixed delay.
 void machine_brew_stop() {
-    machine_brew_stop_standby();
+    s_stop_verifying  = true;
+    s_stop_attempts   = 1;
+    s_stop_latency_ms = 0;
+    s_stop_gave_up    = false;
+    s_stop_first_ms   = millis();
+    send_stop_standby_burst();
+    wlogf("[machine] brew_stop: standby sent, verifying pump-off\n");
+}
+
+// ── Stop instrumentation (read by ui.cpp at shot end, for the bbw event) ───────
+// Valid from the machine_brew_stop() call until the next one. Shot end happens
+// only after the lever returns to Stop, well past every terminal state of the
+// verify machine, so these are final by the time ui.cpp reads them.
+
+uint8_t machine_stop_attempts() {
+    return s_stop_attempts;
+}
+
+uint32_t machine_stop_latency_ms() {
+    return s_stop_latency_ms;   // 0 = pump-off never confirmed
+}
+
+bool machine_stop_gave_up() {
+    return s_stop_gave_up;
 }

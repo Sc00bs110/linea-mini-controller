@@ -43,4 +43,10 @@ void machine_clean_start();
 void machine_clean_stop();
 bool machine_clean_active();
 bool machine_clean_ready();   // burst done — lever may go to Brew now
-void machine_brew_stop();                    // immediate standby-toggle stop (0x8000 rejected by GICAR)
+void machine_brew_stop();                    // supervised standby-toggle stop (0x8000 rejected by GICAR)
+
+// Diagnostics for the last machine_brew_stop(), collected into the per-shot bbw
+// event (src/bbw_event.h). Reset on each new stop.
+uint8_t  machine_stop_attempts();     // standby bursts sent (1 = first try worked)
+uint32_t machine_stop_latency_ms();   // first burst → pump-off confirm; 0 = never confirmed
+bool     machine_stop_gave_up();      // retries exhausted with the pump still running

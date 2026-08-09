@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "bbw_event.h"
 #include "button.h"
 #include "settings.h"
 #include "machine.h"
@@ -11,7 +12,7 @@
 #include "version.h"
 #include "wlog.h"
 #include <time.h>
-#include <math.h>   // fabsf() — bbw tare-confirmation check
+#include <math.h>   // fabsf() — bbw arm-confirmation check
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -107,12 +108,13 @@ static bool     bbw_stop_fired = false;
 // weight-target stop and the scale-loss failsafe so neither fires on a non-bbw
 // shot (demo, or a real shot with no scale).
 static bool     bbw_armed = false;
-// True once the shot-start tare has been confirmed applied: a weight sample that
-// arrived after this shot started has been observed reading ~0 g. The tare is a
-// QUEUED BLE command (takes a few hundred ms to execute), but the threshold
-// check runs on the same loop pass and every pass after — so an untared cup left
-// on the scale (~500 g) would read >= threshold and stop the shot instantly.
-// Gating the threshold check on this flag prevents that pre-tare false stop.
+// True once the threshold stop is armed for this shot: a weight sample that
+// arrived AFTER this shot started has been observed reading near zero. Without
+// this gate the first passes still see a STALE pre-shot sample — an untared cup
+// left on the scale (~500 g) would read >= threshold and stop the shot instantly.
+// The Bookoo auto-tares when the cup is placed, so the near-zero reading comes
+// from the scale itself, not from our queued tare command (v0.42: window widened
+// 0.5 g → 3.0 g accordingly — see the gate below).
 static bool     bbw_tared = false;
 
 // ─── Demo mode ────────────────────────────────────────────────────────────────
@@ -1934,9 +1936,13 @@ void ui_tick() {
         // so a mid-shot scale dropout still counts as bbw (the failsafe stops it).
         bbw_armed = scale_connected() && settings.brew_target_g > 0.0f &&
                     !machine_clean_active();
-        wlogf("[bbw] shot start (tare-gated): armed=%d scale=%d target=%.1f offset=%.1f\n",
+        wlogf("[bbw] shot start (arm-gated): armed=%d scale=%d target=%.1f offset=%.1f\n",
               bbw_armed, scale_connected(), settings.brew_target_g,
               settings.prestop_offset_g);
+        // Start the per-shot diagnostic record. Reset unconditionally (even for
+        // shots the collector will later skip) so nothing leaks between shots.
+        bbw_event_shot_start(bbw_armed,
+                             settings.brew_target_g - settings.prestop_offset_g);
         // During a cleaning cycle the overlay is the UI — no shot timer.
         if (cur_screen == UI_MAIN && !machine_clean_active()) ui_show_timer();
     }
@@ -1957,35 +1963,44 @@ void ui_tick() {
             // so never let it keep running blind.
             machine_brew_stop();
             bbw_stop_fired = true;
+            bbw_event_stop("scale_lost", get_display_weight());
             wlogf("[bbw] FAILSAFE stop: scale data lost mid-shot\n");
         } else if (!bbw_tared) {
-            // Gate the threshold stop until the shot-start tare has actually
-            // executed. scale_tare_and_start() only queues the BLE tare (drained
-            // ~200 ms later), so on the first passes get_display_weight() still
-            // returns a STALE pre-tare sample — evaluating the threshold now
+            // Gate the threshold stop until a weight sample from THIS shot has
+            // been seen reading near zero. On the first passes get_display_weight()
+            // still returns a STALE pre-shot sample — evaluating the threshold now
             // would stop the shot at ~0 s.
             //
-            // A value test alone is not enough: on the 2nd shot of a session the
-            // scale is still zeroed from the previous shot's tare, so the stale
-            // sample already reads near zero and would latch the gate instantly
-            // (also silently defeating the 10 s failsafe below). Require the
-            // sample itself to have arrived AFTER this shot started, and require
-            // a genuine ~0 g reading rather than merely "under 5 g".
+            // A value test alone is not enough: the scale is still zeroed from the
+            // previous shot, so the stale sample already reads near zero and would
+            // latch the gate instantly (also silently defeating the 10 s failsafe
+            // below). Require the sample itself to have arrived AFTER this shot
+            // started.
+            //
+            // The window is 3 g, not the old 0.5 g: the Bookoo auto-tares when the
+            // cup is placed, so by shot start it already reads ~0 and the commanded
+            // tare is belt-and-braces only. Demanding a fresh sub-0.5 g sample made
+            // the gate depend on that queued BLE tare landing, and when it didn't
+            // the 10 s failsafe killed the shot — one of the two field failure
+            // modes v0.42 addresses. 3 g still catches a genuinely untared cup.
             uint32_t age = scale_weight_age_ms();
             bool sample_is_post_tare =
                 (age != UINT32_MAX) && (age <= millis() - brew_start_ms);
             float w = get_display_weight();
-            if (sample_is_post_tare && fabsf(w) < 0.5f) {
+            if (sample_is_post_tare && fabsf(w) < 3.0f) {
                 bbw_tared = true;
-                wlogf("[bbw] tare confirmed (w=%.2f, age=%lums)\n", w,
+                bbw_event_arm_confirmed(millis() - brew_start_ms, w);
+                wlogf("[bbw] arm confirmed (w=%.2f, age=%lums)\n", w,
                       (unsigned long)age);
             } else if (millis() - brew_start_ms > 10000) {
-                // Failsafe: if the tare never confirms (queued BLE tare lost),
-                // the threshold stop can never arm — don't let the shot run
-                // blind. Same spirit as the scale-lost failsafe above.
+                // Failsafe: with no fresh near-zero sample the threshold stop can
+                // never arm (scale silent, or a large untared weight on the pan) —
+                // don't let the shot run blind. Same spirit as the scale-lost
+                // failsafe above.
                 machine_brew_stop();
                 bbw_stop_fired = true;
-                wlogf("[bbw] FAILSAFE stop: tare never confirmed (w=%.2f, age=%lums)\n",
+                bbw_event_stop("arm_failsafe", w);
+                wlogf("[bbw] FAILSAFE stop: arm never confirmed (w=%.2f, age=%lums)\n",
                       w, (unsigned long)age);
             }
         } else {
@@ -1993,6 +2008,7 @@ void ui_tick() {
             if (threshold > 0 && get_display_weight() >= threshold) {
                 machine_brew_stop();
                 bbw_stop_fired = true;
+                bbw_event_stop("threshold", get_display_weight());
                 wlogf("[bbw] threshold %.1fg reached (w=%.1f)\n", threshold,
                       get_display_weight());
             }
@@ -2002,6 +2018,20 @@ void ui_tick() {
     if (was_brew && !brew_now) {
         brew_end_ms    = millis();
         returning_brew = true;
+        // Close the diagnostic record. This edge is the lever returning to Stop,
+        // which is well past every terminal state of the supervised stop, so the
+        // machine_stop_*() accessors are final here. They describe the LAST stop
+        // sent, so pass zeros when this shot never fired one (manual lever stop) —
+        // otherwise the previous shot's numbers would leak into this record.
+        // Real shots only, same gate as the shot counter below: a clean-cycle
+        // pump phase (~80 s, unarmed) or a 30 s demo brew would otherwise
+        // overwrite the retained record of the user's last actual shot.
+        if (!machine_clean_active() && machine.connected) {
+            bbw_event_shot_end(brew_end_ms - brew_start_ms, get_display_weight(),
+                               bbw_stop_fired ? machine_stop_attempts() : 0,
+                               bbw_stop_fired ? machine_stop_latency_ms() : 0,
+                               bbw_stop_fired ? machine_stop_gave_up() : false);
+        }
         // Count as a shot only if the pump ran >= 20 s; shorter runs are a
         // group-head flush, not a pull. Clean-cycle pump phases are not shots.
         if ((brew_end_ms - brew_start_ms) >= 20000 && !machine_clean_active()) {
