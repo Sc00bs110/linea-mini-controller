@@ -2030,7 +2030,9 @@ void ui_tick() {
             bbw_event_shot_end(brew_end_ms - brew_start_ms, get_display_weight(),
                                bbw_stop_fired ? machine_stop_attempts() : 0,
                                bbw_stop_fired ? machine_stop_latency_ms() : 0,
-                               bbw_stop_fired ? machine_stop_gave_up() : false);
+                               bbw_stop_fired ? machine_stop_gave_up() : false,
+                               bbw_stop_fired ? machine_stop_ack_seen() : false,
+                               bbw_stop_fired ? machine_stop_ack_ok() : false);
         }
         // Count as a shot only if the pump ran >= 20 s; shorter runs are a
         // group-head flush, not a pull. Clean-cycle pump phases are not shots.

@@ -62,6 +62,16 @@ bool           gicar_r_brew_active();       // payload[17] == 0x01
 uint8_t        gicar_r_boiler_flags();      // payload[27] (use BF_* constants)
 float          gicar_r_setpoint();          // setpoint from boot config read (°C)
 
+// ── Write ACK (13 chars: 'w' + addr(4) + len(4) + "OK" + cs(2)) ─────────────
+// Observed passively — gicar_write() stays fire-and-forget, these just report
+// what came back. Only the FIRST unconsumed ACK is latched: a standby burst
+// sends five writes back-to-back and the drain loop parses them all in one
+// pass, so last-wins would always leave the final sync register here.
+bool           gicar_ack_ready();           // true once per ACK frame (clears on read)
+uint16_t       gicar_ack_addr();            // register the ACK refers to
+bool           gicar_ack_ok();              // status field was "OK"
+uint32_t       gicar_ack_age_ms();          // millis() since the latched ACK was parsed
+
 // ── Commands ─────────────────────────────────────────────────────────────────
 void gicar_write(uint16_t addr, const uint8_t* data, uint16_t len);
 // Override the R-poll cadence (0 = restore the 760 ms default). The factory

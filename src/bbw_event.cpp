@@ -44,11 +44,17 @@ void bbw_event_stop(const char *reason, float w) {
 
 void bbw_event_shot_end(uint32_t duration_ms, float final_weight_g,
                         uint8_t stop_attempts, uint32_t stop_latency_ms,
-                        bool gave_up) {
+                        bool gave_up,
+                        bool ack_seen, bool ack_ok) {
     if (!s_armed && duration_ms < MIN_UNARMED_SHOT_MS) {
         wlogf("[bbw_event] skipped unarmed short shot (%ums)\n", (unsigned)duration_ms);
         return;
     }
+
+    // "ok"/"ko" = the GICAR answered the stop's 0x0000 write; "none" = no ack
+    // came back (or no auto-stop fired at all). Distinguishes a write the
+    // controller never took from a command it took and ignored.
+    const char *stop_ack = ack_seen ? (ack_ok ? "ok" : "ko") : "none";
 
     String json = "{";
     json += "\"duration_ms\":" + String((unsigned)duration_ms) + ",";
@@ -61,16 +67,17 @@ void bbw_event_shot_end(uint32_t duration_ms, float final_weight_g,
     json += "\"stop_attempts\":" + String((unsigned)stop_attempts) + ",";
     json += "\"stop_latency_ms\":" + String((unsigned)stop_latency_ms) + ",";
     json += "\"gave_up\":" + String(gave_up ? "true" : "false") + ",";
+    json += "\"stop_ack\":\"" + String(stop_ack) + "\",";
     json += "\"final_weight_g\":" + String(final_weight_g, 1);
     json += "}";
 
     s_pending_json = json;
     s_pending      = true;
     wlogf("[bbw_event] %ums armed=%d reason=%s stop_w=%.1f thr=%.1f "
-          "attempts=%u latency=%ums gave_up=%d final=%.1fg\n",
+          "attempts=%u latency=%ums gave_up=%d ack=%s final=%.1fg\n",
           (unsigned)duration_ms, s_armed, s_stop_reason.c_str(), s_stop_w,
           s_threshold_g, (unsigned)stop_attempts, (unsigned)stop_latency_ms,
-          gave_up, final_weight_g);
+          gave_up, stop_ack, final_weight_g);
 }
 
 bool bbw_event_has_pending() { return s_pending; }

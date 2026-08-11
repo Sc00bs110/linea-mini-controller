@@ -31,6 +31,12 @@ static uint32_t s_stop_first_ms   = 0;      // millis() of the first burst (late
 static uint8_t  s_stop_attempts   = 0;      // bursts sent for the current stop
 static uint32_t s_stop_latency_ms = 0;      // first burst → pump-off confirm (0 = never confirmed)
 static bool     s_stop_gave_up    = false;  // attempts exhausted with the pump still running
+// v0.43 instrumentation: did the GICAR ACK the 0x0000 write of the most recent
+// burst? Observed only — nothing below branches on these. They exist to answer
+// whether a swallowed stop is a swallowed WRITE or an ignored command, which
+// the pump flag alone cannot distinguish.
+static bool     s_stop_ack_seen   = false;  // an ACK for 0x0000 arrived after the burst
+static bool     s_stop_ack_ok     = false;  // ...and its status field said "OK"
 
 // Disconnect timeout: mark the machine offline if no R or Z frame arrives within
 // this window. The R-frame poll runs at ~760 ms, so 3 s tolerates a few misses.
@@ -68,6 +74,10 @@ static void send_stop_standby_burst() {
     for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
     s_stop_sent_ms      = millis();
     s_stop_wake_pending = true;   // second wake once the lever returns to Stop
+    // Per-attempt ack tracking: a resend gets a fresh verdict, so the reported
+    // value is "was the LAST burst acked" (the burst that actually stopped it).
+    s_stop_ack_seen     = false;
+    s_stop_ack_ok       = false;
 }
 
 // Schedule the wake that undoes the stop's standby. EVERY path out of the
@@ -157,6 +167,25 @@ void machine_update() {
         gicar_write_byte(0x0000, 0x01);
         for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
         wlogf("[machine] brew_stop: wake sent\n");
+    }
+
+    // ── Write-ACK observation (v0.43) ───────────────────────────────────────────
+    // Drained EVERY pass, not just while verifying: the latch must never go
+    // stale. 0x0000 is also written by machine_set_standby() and by the wake
+    // above, so an unconsumed ack from minutes ago would otherwise be read as
+    // this stop's ack one tick after the burst — before the real one could
+    // physically arrive at 9600 baud. The age check rejects any ack that
+    // predates the burst for the same reason. Purely observational: this block
+    // touches only s_stop_ack_*, never the attempt/retry/confirm/give-up state.
+    if (gicar_ack_ready()) {
+        bool after_burst = gicar_ack_age_ms() <= (millis() - s_stop_sent_ms);
+        if (s_stop_verifying && !s_stop_ack_seen && after_burst &&
+            gicar_ack_addr() == 0x0000) {
+            s_stop_ack_seen = true;
+            s_stop_ack_ok   = gicar_ack_ok();
+            wlogf("[machine] brew_stop: 0x0000 write ACK %s\n",
+                  s_stop_ack_ok ? "OK" : "KO");
+        }
     }
 
     // Debounce timer: brew_active only clears after 1 s of continuous false R-frames.
@@ -414,4 +443,12 @@ uint32_t machine_stop_latency_ms() {
 
 bool machine_stop_gave_up() {
     return s_stop_gave_up;
+}
+
+bool machine_stop_ack_seen() {
+    return s_stop_ack_seen;
+}
+
+bool machine_stop_ack_ok() {
+    return s_stop_ack_ok;
 }

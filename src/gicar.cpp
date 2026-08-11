@@ -21,16 +21,22 @@
 // every preceding char) mod 256. Payload bytes inside R/Z frames are carried as
 // hex pairs (two ASCII chars per byte).
 //
-// Three machine→ESP32 frame types are recognised by their first char:
+// Four machine→ESP32 frame types are recognised by their first char:
 //   'R'  poll response   — 81 chars, authoritative machine state (~760 ms)
 //   'Z'  shot telemetry  — 55 chars, autonomous, only during brew/backflush
 //   'X'  X-probe reply    — 11 chars, boot handshake only
+//   'W'  write ACK       — 13 chars, follows a W command (see _parse_w_frame)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Framing constants ───────────────────────────────────────────────────────
 static const int      R_FRAME_LEN   = GICAR_R_FRAME_LEN;  // 81
 static const int      Z_FRAME_LEN   = GICAR_Z_FRAME_LEN;  // 54
 static const int      X_FRAME_LEN   = 11;                 // "X00000001D9"
+// Write ACK: 'w' + addr(4) + len(4) + "OK"(2) + cs(2) = 13 chars, e.g.
+// "w00560001OK9D". Documented for the Gicar family in
+// reference/lm_mini/gicar-serial/protocol.md; NOT yet confirmed on this
+// machine, which is exactly why observing it is passive instrumentation only.
+static const int      ACK_FRAME_LEN = 13;
 // Config-block read response (0x0000/0x0020): "R" + addr(4) + len(4) +
 // 2*32 hex + cs(2). Carries the machine's live setpoint at payload[7..8].
 static const int      R_CFG_FRAME_LEN = 9 + 2 * 0x20 + 2; // 75
@@ -79,6 +85,17 @@ static uint8_t  _r_boiler        = 0;
 static float    _r_setpoint      = 0.0f;   // from boot config read
 static uint32_t _r_frame_count   = 0;
 static uint32_t _last_r_frame_ms = 0;
+
+// ── Write-ACK results ────────────────────────────────────────────────────────
+// First-wins latch: _ack_ready is only set when the previous ACK has been
+// consumed. A standby burst writes five registers back-to-back (~68 ms at
+// 9600 baud), so gicar_process() parses all five ACKs in a single drain pass —
+// a last-wins slot would always end up holding the burst's LAST register and
+// never the one the caller is looking for.
+static bool     _ack_ready = false;
+static uint16_t _ack_addr  = 0;
+static bool     _ack_ok    = false;
+static uint32_t _ack_ms    = 0;
 
 // ── Handshake / boot state ───────────────────────────────────────────────────
 static bool     _hs_ok = false;
@@ -294,6 +311,44 @@ static void _parse_z_frame(const char* buf, int len) {
     _frame_count++;
 }
 
+// Write ACK: 'w' + addr(4) + len(4) + status(2) + cs(2) = 13 chars.
+// The status field is 2 ASCII chars, "OK" on success. Both cases of the start
+// char are accepted: the family docs show a lowercase reply to an uppercase
+// command, but which case THIS machine uses is unverified.
+static void _parse_w_frame(const char* buf, int len) {
+    if (len != ACK_FRAME_LEN) {
+        wlogf("[gicar] W-ack bad header len=%d c=%c\n", len, buf[0]);
+        return;
+    }
+
+    // Checksum covers everything except the trailing 2 checksum chars.
+    uint8_t want = _cs(buf, len - 2);
+    uint8_t got  = _hex2(buf[len - 2], buf[len - 1]);
+    if (want != got) {
+        // Dump the raw frame: this frame type has never been seen on this
+        // machine, so if the real reply is not 13 chars (a KO variant, say)
+        // this log is the only thing that will show it.
+        wlogf("[gicar] W-ack checksum %02X!=%02X (%.13s)\n", got, want, buf);
+        return;
+    }
+
+    uint16_t addr = (uint16_t)(((uint16_t)_hex2(buf[1], buf[2]) << 8) |
+                                _hex2(buf[3], buf[4]));
+    bool     ok   = (buf[9] == 'O' && buf[10] == 'K');
+
+    // ACKs are low-frequency (they only follow a write), so log every one
+    // unconditionally — unlike the 760 ms R-frame, which is throttled to 1 Hz.
+    wlogf("[gicar] ack addr=%04X %s\n", addr, ok ? "OK" : "KO");
+
+    // First-wins: never clobber an ACK the caller has not consumed yet.
+    if (!_ack_ready) {
+        _ack_addr  = addr;
+        _ack_ok    = ok;
+        _ack_ms    = millis();
+        _ack_ready = true;
+    }
+}
+
 // Map a frame-start char to its expected total length. Returns 0 if `c` is not
 // a recognised frame-start char.
 static int _frame_len_for(char c) {
@@ -301,6 +356,8 @@ static int _frame_len_for(char c) {
         case 'R': return R_FRAME_LEN;
         case 'Z': return Z_FRAME_LEN;
         case 'X': return X_FRAME_LEN;
+        case 'W':
+        case 'w': return ACK_FRAME_LEN;
         default:  return 0;
     }
 }
@@ -310,6 +367,8 @@ static void _dispatch(const char* buf, int len) {
     switch (buf[0]) {
         case 'R': _parse_r_frame(buf, len); break;
         case 'Z': _parse_z_frame(buf, len); break;
+        case 'W':
+        case 'w': _parse_w_frame(buf, len); break;
         case 'X':
             // X-probe reply during boot — record handshake success.
             _hs_ok = true;
@@ -489,6 +548,17 @@ bool gicar_r_frame_ready() {
     _r_ready = false;
     return true;
 }
+
+// ── Write-ACK accessors ──────────────────────────────────────────────────────
+bool gicar_ack_ready() {
+    if (!_ack_ready) return false;
+    _ack_ready = false;
+    return true;
+}
+
+uint16_t gicar_ack_addr()    { return _ack_addr; }
+bool     gicar_ack_ok()      { return _ack_ok; }
+uint32_t gicar_ack_age_ms()  { return millis() - _ack_ms; }
 
 float   gicar_r_temp()         { return _r_temp; }
 bool    gicar_r_brew_active()  { return _r_brew; }
