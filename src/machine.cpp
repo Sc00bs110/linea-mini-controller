@@ -21,16 +21,30 @@ static bool s_stop_wake_pending = false;
 // of the ~50% brew-by-weight runaways). The pump flag in the R-frame poll IS the
 // ack: verify it goes false, resend the burst if it doesn't, and only then wake.
 // Note pump_active is raw/undebounced — that is what we want here.
-static const uint32_t STOP_RETRY_MS       = 1800;  // ≥2 R-poll periods (~760 ms each)
+// v0.47: STOP_RETRY_MS widened 1800->2600 to fit STOP_CONFIRM_FRAMES's 2-frame
+// debounce comfortably before a resend would otherwise race it (see below).
+static const uint32_t STOP_RETRY_MS       = 2600;  // ≥3 R-poll periods (~760 ms each)
 static const uint32_t STOP_CONFIRM_MIN_MS = 800;   // ignore frames polled before the burst
+static const uint8_t  STOP_CONFIRM_FRAMES = 2;     // consecutive pump-off R-frames required
 static const uint8_t  STOP_MAX_ATTEMPTS   = 3;
 
-static bool     s_stop_verifying  = false;  // true between the first burst and confirm/give-up
-static uint32_t s_stop_sent_ms    = 0;      // millis() of the most recent burst
-static uint32_t s_stop_first_ms   = 0;      // millis() of the first burst (latency reference)
-static uint8_t  s_stop_attempts   = 0;      // bursts sent for the current stop
-static uint32_t s_stop_latency_ms = 0;      // first burst → pump-off confirm (0 = never confirmed)
-static bool     s_stop_gave_up    = false;  // attempts exhausted with the pump still running
+static bool     s_stop_verifying   = false;  // true between the first burst and confirm/give-up
+static uint32_t s_stop_sent_ms     = 0;      // millis() of the most recent burst
+static uint32_t s_stop_first_ms    = 0;      // millis() of the first burst (latency reference)
+static uint8_t  s_stop_attempts    = 0;      // bursts sent for the current stop
+static uint32_t s_stop_latency_ms  = 0;      // first burst → pump-off confirm (0 = never confirmed)
+static bool     s_stop_gave_up     = false;  // attempts exhausted with the pump still running
+// v0.47: a single R-frame reading pump_active=false is not proof of a real
+// stop -- field evidence (2026-08-12: stop_ack="ok", stop_attempts=1,
+// stop_latency_ms=1249, yet the shot ran 51s and had to be stopped by hand)
+// showed the confirm firing on a transient/spurious single-frame blip while
+// the machine's own queued-standby behavior (0x0000 is really PowerOff --
+// mid-brew it's accepted but not applied until the lever returns) meant the
+// pump never actually stopped. machine.brew_active already debounces the
+// SAME raw-R-frame unreliability with a 1 s continuous-false requirement;
+// the stop confirm never had that protection. Require STOP_CONFIRM_FRAMES
+// consecutive false readings instead of one.
+static uint8_t  s_stop_confirm_run = 0;      // consecutive pump-off R-frames seen this burst
 // v0.43 instrumentation: did the GICAR ACK the 0x0000 write of the most recent
 // burst? Observed only — nothing below branches on these. They exist to answer
 // whether a swallowed stop is a swallowed WRITE or an ignored command, which
@@ -78,6 +92,9 @@ static void send_stop_standby_burst() {
     // value is "was the LAST burst acked" (the burst that actually stopped it).
     s_stop_ack_seen     = false;
     s_stop_ack_ok       = false;
+    // A resend needs its own fresh debounce run, not credit carried over from
+    // a false-off blip observed against the PREVIOUS (evidently ineffective) burst.
+    s_stop_confirm_run  = 0;
 }
 
 // Schedule the wake that undoes the stop's standby. EVERY path out of the
@@ -92,16 +109,28 @@ static void schedule_stop_wake() {
 // polled before our burst landed: without it a pump that happens to be idle at
 // the moment of the stop (preinfusion pause, or the 10 s arm failsafe firing
 // during one) would "confirm" a stop that was never actually applied.
+// STOP_CONFIRM_FRAMES then requires that idle reading to REPEAT on the next
+// R-frame too before trusting it — a lone false reading resets the run rather
+// than confirming, since a single stale/transient blip is not distinguishable
+// from a real stop otherwise (field-confirmed 2026-08-12, see the constant's
+// comment above).
 static void stop_supervise_frame() {
     if (!s_stop_verifying) return;
     if (millis() - s_stop_sent_ms < STOP_CONFIRM_MIN_MS) return;
-    if (machine.pump_active) return;
+
+    if (machine.pump_active) {
+        s_stop_confirm_run = 0;
+        return;
+    }
+
+    s_stop_confirm_run++;
+    if (s_stop_confirm_run < STOP_CONFIRM_FRAMES) return;
 
     s_stop_verifying  = false;
     s_stop_latency_ms = millis() - s_stop_first_ms;
     schedule_stop_wake();
-    wlogf("[machine] brew_stop: pump off confirmed after %u ms (%u attempt(s)), wake in 500ms\n",
-          (unsigned)s_stop_latency_ms, (unsigned)s_stop_attempts);
+    wlogf("[machine] brew_stop: pump off confirmed after %u ms (%u attempt(s), %u consecutive frames), wake in 500ms\n",
+          (unsigned)s_stop_latency_ms, (unsigned)s_stop_attempts, (unsigned)STOP_CONFIRM_FRAMES);
 }
 
 // Timing half — called unconditionally every machine_update() so the state
@@ -326,7 +355,18 @@ void machine_update() {
     }
 
     // ── Disconnect timeout ───────────────────────────────────────────────────────
-    if (machine.connected && (millis() - machine.last_frame_ms) > DISCONNECT_TIMEOUT_MS) {
+    // Suppressed during the cleaning cycle: its quiet period deliberately slows
+    // polling to 10 s, which would otherwise trip this 3 s timeout on every
+    // poll gap and flap the connected flag throughout every clean. NOTE: the
+    // cleaning cycle's own completion trigger (ui.cpp CLEAN_RUNNING) is
+    // intentionally the ORIGINAL z_shot_active edge-detect, not a time-based
+    // wait -- an earlier attempt to replace it with a pure `!machine_clean_active()`
+    // wait broke the real 10-phase backflush (confirmed: v0.43 edge-detect ran
+    // 10/10 phases live; the time-based replacement stopped after 1). Do not
+    // change that trigger without live evidence of z_shot_active's real
+    // behavior across a full cycle.
+    if (machine.connected && !machine_clean_active() &&
+        (millis() - machine.last_frame_ms) > DISCONNECT_TIMEOUT_MS) {
         machine.connected = false;
         wlogf("[machine] disconnected — no frames for %lu ms\n",
               (unsigned long)DISCONNECT_TIMEOUT_MS);

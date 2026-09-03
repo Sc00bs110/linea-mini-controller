@@ -300,7 +300,7 @@ static void clean_show_done(const char* title) {
     s_clean_stage = CLEAN_DONE;
     lv_label_set_text(lbl_clean_overlay_title, title);
     lv_label_set_text(lbl_clean_overlay_sub,
-                      "Move the lever to Stop.\nTap to close.");
+                      "Move the lever to 'Stop'.\nTap to close.");
     lv_obj_add_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
 }
@@ -508,7 +508,7 @@ static void ui_main_create() {
 
     lbl_clean_overlay_sub = lv_label_create(obj_clean_overlay);
     lv_label_set_text(lbl_clean_overlay_sub,
-                      "Preparing the machine...\nKeep the lever down.");
+                      "Preparing the machine...\nKeep the lever at 'Stop'.");
     lv_obj_set_style_text_font(lbl_clean_overlay_sub, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(lbl_clean_overlay_sub, lv_color_make(0xCC, 0xCC, 0xCC), 0);
     lv_obj_set_style_text_align(lbl_clean_overlay_sub, LV_TEXT_ALIGN_CENTER, 0);
@@ -1811,7 +1811,7 @@ void ui_tick() {
         s_clean_stage = CLEAN_PREP;
         lv_label_set_text(lbl_clean_overlay_title, "Cleaning cycle");
         lv_label_set_text(lbl_clean_overlay_sub,
-                          "Preparing the machine...\nKeep the lever down.");
+                          "Preparing the machine...\nKeep the lever at 'Stop'.");
         lv_obj_add_flag(lbl_clean_count, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(obj_clean_stop, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(obj_clean_overlay, LV_OBJ_FLAG_HIDDEN);
@@ -1885,7 +1885,7 @@ void ui_tick() {
             if (machine_clean_ready()) {
                 s_clean_stage = CLEAN_WAIT_LEVER;
                 lv_label_set_text(lbl_clean_overlay_sub,
-                                  "Lift the brew lever to start.\nTap to cancel.");
+                                  "Move the lever to 'Brew' to start.\nTap to cancel.");
             }
             break;
         case CLEAN_WAIT_LEVER:
