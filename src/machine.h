@@ -50,7 +50,9 @@ void machine_brew_stop();                    // supervised standby-toggle stop (
 uint8_t  machine_stop_attempts();     // standby bursts sent (1 = first try worked)
 uint32_t machine_stop_latency_ms();   // first burst → pump-off confirm; 0 = never confirmed
 bool     machine_stop_gave_up();      // retries exhausted with the pump still running
-// Did the GICAR ack the 0x0000 write of the most recent burst? Observational
-// only — reset per burst, so a stop that needed a resend reports the LAST one.
+// Did the GICAR ack the 0x0000 write of the most recent burst? Reset per burst,
+// so a stop that needed a resend reports the LAST one. Since v0.48 this ack also
+// gates the config-sync regs and ends the ACK-resend cycle.
 bool     machine_stop_ack_seen();     // an ACK frame for 0x0000 came back
 bool     machine_stop_ack_ok();       // ...and its status said "OK"
+uint8_t  machine_stop_ack_resends();  // 0x0000 resends this stop needed, all bursts summed

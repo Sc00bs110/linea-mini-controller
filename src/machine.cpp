@@ -15,11 +15,14 @@ static uint32_t s_brew_stop_wake_ms = 0;
 static bool s_stop_wake_pending = false;
 
 // ── Supervised brew stop ───────────────────────────────────────────────────────
-// The GICAR never acks a write, so the old fire-and-forget stop had no way to
-// know the burst was swallowed (the controller streams Z-frames at ~600 B/s
-// during a shot and mishandles inbound traffic mid-stream — the documented cause
-// of the ~50% brew-by-weight runaways). The pump flag in the R-frame poll IS the
-// ack: verify it goes false, resend the burst if it doesn't, and only then wake.
+// The GICAR DOES ack writes — but while a shot runs it streams Z-frames at
+// ~600 B/s and drops the LEADING writes of a back-to-back burst (wlog captures
+// 2026-09-07: the misses acked only 0401/0402/0406, then 0402/0406, never the
+// 0x0000 that IS the stop — the documented cause of the ~50% brew-by-weight
+// runaways). v0.48 therefore drives the 0x0000 write by its own ACK: send it
+// alone, resend it until it is acked, and only then push the config-sync regs.
+// The pump flag in the R-frame poll remains the second-line ack: verify it goes
+// false, resend the whole burst if it doesn't, and only then wake.
 // Note pump_active is raw/undebounced — that is what we want here.
 // v0.47: STOP_RETRY_MS widened 1800->2600 to fit STOP_CONFIRM_FRAMES's 2-frame
 // debounce comfortably before a resend would otherwise race it (see below).
@@ -27,6 +30,12 @@ static const uint32_t STOP_RETRY_MS       = 2600;  // ≥3 R-poll periods (~760 
 static const uint32_t STOP_CONFIRM_MIN_MS = 800;   // ignore frames polled before the burst
 static const uint8_t  STOP_CONFIRM_FRAMES = 2;     // consecutive pump-off R-frames required
 static const uint8_t  STOP_MAX_ATTEMPTS   = 3;
+// v0.48 ACK-driven 0x0000 resend. 300 ms: the 13-char command plus its 13-char
+// reply is ~30 ms at 9600 baud and good captures answered within ~100 ms, with a
+// Z-frame already in flight adding ~60 ms. 6 resends bounds the cycle at ~2 s,
+// inside STOP_RETRY_MS so the existing pump-off retry still fires afterwards.
+static const uint32_t STOP_ACK_WAIT_MS    = 300;
+static const uint8_t  STOP_ACK_MAX_RESENDS = 6;
 
 static bool     s_stop_verifying   = false;  // true between the first burst and confirm/give-up
 static uint32_t s_stop_sent_ms     = 0;      // millis() of the most recent burst
@@ -45,12 +54,16 @@ static bool     s_stop_gave_up     = false;  // attempts exhausted with the pump
 // the stop confirm never had that protection. Require STOP_CONFIRM_FRAMES
 // consecutive false readings instead of one.
 static uint8_t  s_stop_confirm_run = 0;      // consecutive pump-off R-frames seen this burst
-// v0.43 instrumentation: did the GICAR ACK the 0x0000 write of the most recent
-// burst? Observed only — nothing below branches on these. They exist to answer
-// whether a swallowed stop is a swallowed WRITE or an ignored command, which
-// the pump flag alone cannot distinguish.
+// v0.43 instrumentation, promoted to control in v0.48: did the GICAR ACK the
+// 0x0000 write of the most recent burst? The ACK now gates the config-sync regs
+// and ends the resend cycle below — it is no longer observational.
 static bool     s_stop_ack_seen   = false;  // an ACK for 0x0000 arrived after the burst
 static bool     s_stop_ack_ok     = false;  // ...and its status field said "OK"
+// v0.48 ACK-driven resend state.
+static uint32_t s_stop_zero_sent_ms      = 0;      // millis() of the most recent 0x0000 write
+static bool     s_stop_sync_pending      = false;  // config-sync regs still owed for this burst
+static uint8_t  s_stop_ack_resends       = 0;      // 0x0000 resends within the current burst
+static uint8_t  s_stop_total_ack_resends = 0;      // ...summed over every burst of this stop
 
 // Disconnect timeout: mark the machine offline if no R or Z frame arrives within
 // this window. The R-frame poll runs at ~760 ms, so 3 s tolerates a few misses.
@@ -75,7 +88,21 @@ static void gicar_write_byte(uint16_t addr, uint8_t value) {
     gicar_write(addr, &value, 1);
 }
 
-// Standby-toggle brew stop burst: force standby (0x0000=0x00 + config-sync regs).
+// Push the four config-sync regs that follow a standby toggle, once, if this
+// burst still owes them. v0.48 defers them until the 0x0000 write is acked (see
+// the section header) — but EVERY exit from the verify machine must flush them,
+// so a stop confirmed by the pump flag before the ACK arrives still leaves the
+// machine with the same register state the pre-v0.48 fire-and-forget burst gave it.
+static void flush_stop_sync_regs() {
+    if (!s_stop_sync_pending) return;
+    s_stop_sync_pending = false;
+    for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
+}
+
+// Standby-toggle brew stop burst: force standby. v0.48 sends ONLY 0x0000=0x00
+// here — the config-sync regs follow via flush_stop_sync_regs() once the write is
+// acked, because sending all five back-to-back is exactly what made the GICAR
+// drop the leading 0x0000 mid-shot.
 // Side effects observed in the field: the group's reheat and the next pull can
 // need a lever cycle when the lever returns during the standby/wake window (a
 // 10 s lever hold after the stop reheated fine, 2026-07-14). This is the only
@@ -85,7 +112,9 @@ static void gicar_write_byte(uint16_t addr, uint8_t value) {
 // wake that already went out.
 static void send_stop_standby_burst() {
     gicar_write_byte(0x0000, 0x00);
-    for (uint16_t reg : STANDBY_SYNC_REGS) gicar_write_byte(reg, 0x00);
+    s_stop_zero_sent_ms = millis();
+    s_stop_sync_pending = true;   // owed until the 0x0000 ACK lands (or the resends run out)
+    s_stop_ack_resends  = 0;      // each burst gets its own ACK-resend budget
     s_stop_sent_ms      = millis();
     s_stop_wake_pending = true;   // second wake once the lever returns to Stop
     // Per-attempt ack tracking: a resend gets a fresh verdict, so the reported
@@ -128,6 +157,7 @@ static void stop_supervise_frame() {
 
     s_stop_verifying  = false;
     s_stop_latency_ms = millis() - s_stop_first_ms;
+    flush_stop_sync_regs();   // confirm can beat the ACK; the regs are still owed
     schedule_stop_wake();
     wlogf("[machine] brew_stop: pump off confirmed after %u ms (%u attempt(s), %u consecutive frames), wake in 500ms\n",
           (unsigned)s_stop_latency_ms, (unsigned)s_stop_attempts, (unsigned)STOP_CONFIRM_FRAMES);
@@ -139,6 +169,35 @@ static void stop_supervise_frame() {
 // STOP_MAX_ATTEMPTS * STOP_RETRY_MS.
 static void stop_supervise_timing() {
     if (!s_stop_verifying) return;
+
+    // ── v0.48: ACK-driven 0x0000 resend ────────────────────────────────────────
+    // Runs ahead of the pump-off retry below and on its own clock
+    // (s_stop_zero_sent_ms), so a resend never disturbs s_stop_sent_ms — that
+    // timestamp anchors both STOP_RETRY_MS here and STOP_CONFIRM_MIN_MS in
+    // stop_supervise_frame(), and sliding it would starve them.
+    // The !s_stop_ack_seen guard makes the invariant explicit: the ACK latch in
+    // gicar.cpp is a single first-wins slot, so a sync-reg ack draining ahead of
+    // the one we want can cost us the 0x0000 ack and inflate the resend count.
+    if (s_stop_sync_pending && !s_stop_ack_seen &&
+        millis() - s_stop_zero_sent_ms >= STOP_ACK_WAIT_MS) {
+        if (s_stop_ack_resends < STOP_ACK_MAX_RESENDS) {
+            gicar_write_byte(0x0000, 0x00);
+            s_stop_ack_resends++;
+            s_stop_total_ack_resends++;
+            s_stop_zero_sent_ms = millis();
+            wlogf("[machine] brew_stop: no 0x0000 ACK in %u ms — resend %u/%u\n",
+                  (unsigned)STOP_ACK_WAIT_MS, (unsigned)s_stop_ack_resends,
+                  (unsigned)STOP_ACK_MAX_RESENDS);
+        } else {
+            // Budget spent. Fall back to the pre-v0.48 behaviour — push the sync
+            // regs regardless — and leave the rest to the pump-off retry below.
+            flush_stop_sync_regs();
+            wlogf("[machine] brew_stop: 0x0000 never ACKed after %u resends — "
+                  "sync regs sent, waiting for pump-off retry\n",
+                  (unsigned)s_stop_ack_resends);
+        }
+    }
+
     if (millis() - s_stop_sent_ms < STOP_RETRY_MS) return;
 
     if (s_stop_attempts < STOP_MAX_ATTEMPTS) {
@@ -155,6 +214,7 @@ static void stop_supervise_timing() {
     // most.
     s_stop_verifying = false;
     s_stop_gave_up   = true;
+    flush_stop_sync_regs();
     schedule_stop_wake();
     wlogf("[machine] brew_stop: GAVE UP after %u attempts — pump still running, wake sent\n",
           (unsigned)s_stop_attempts);
@@ -198,22 +258,29 @@ void machine_update() {
         wlogf("[machine] brew_stop: wake sent\n");
     }
 
-    // ── Write-ACK observation (v0.43) ───────────────────────────────────────────
+    // ── Write-ACK handling (v0.43 observation, v0.48 control) ──────────────────
     // Drained EVERY pass, not just while verifying: the latch must never go
     // stale. 0x0000 is also written by machine_set_standby() and by the wake
     // above, so an unconsumed ack from minutes ago would otherwise be read as
     // this stop's ack one tick after the burst — before the real one could
     // physically arrive at 9600 baud. The age check rejects any ack that
-    // predates the burst for the same reason. Purely observational: this block
-    // touches only s_stop_ack_*, never the attempt/retry/confirm/give-up state.
+    // predates the MOST RECENT 0x0000 write (s_stop_zero_sent_ms, not the burst
+    // start) so a resend's own ack is accepted. v0.48: an ack here also releases
+    // the config-sync regs the burst deliberately withheld.
     if (gicar_ack_ready()) {
-        bool after_burst = gicar_ack_age_ms() <= (millis() - s_stop_sent_ms);
+        bool after_burst = gicar_ack_age_ms() <= (millis() - s_stop_zero_sent_ms);
         if (s_stop_verifying && !s_stop_ack_seen && after_burst &&
             gicar_ack_addr() == 0x0000) {
             s_stop_ack_seen = true;
             s_stop_ack_ok   = gicar_ack_ok();
-            wlogf("[machine] brew_stop: 0x0000 write ACK %s\n",
-                  s_stop_ack_ok ? "OK" : "KO");
+            if (s_stop_sync_pending) {
+                flush_stop_sync_regs();
+                wlogf("[machine] brew_stop: 0x0000 ACK %s after %u resend(s) — sync regs sent\n",
+                      s_stop_ack_ok ? "OK" : "KO", (unsigned)s_stop_ack_resends);
+            } else {
+                wlogf("[machine] brew_stop: 0x0000 write ACK %s\n",
+                      s_stop_ack_ok ? "OK" : "KO");
+            }
         }
     }
 
@@ -232,7 +299,8 @@ void machine_update() {
         machine.last_frame_ms   = millis();
         machine.connected       = true;
 
-        // Fresh pump reading — the only ack the GICAR gives us for a stop.
+        // Fresh pump reading — proof the stop was APPLIED, as opposed to the
+        // 0x0000 write ACK above, which only proves it was received.
         stop_supervise_frame();
 
         if (r_brew) {
@@ -255,6 +323,7 @@ void machine_update() {
                 // still undoes the queued standby.
                 if (s_stop_verifying) {
                     s_stop_verifying = false;
+                    flush_stop_sync_regs();   // owed regs still go out on this exit
                     wlogf("[machine] brew_stop: lever returned before pump-off confirm\n");
                 }
                 if (s_stop_wake_pending) {
@@ -464,6 +533,7 @@ void machine_brew_stop() {
     s_stop_latency_ms = 0;
     s_stop_gave_up    = false;
     s_stop_first_ms   = millis();
+    s_stop_total_ack_resends = 0;   // cumulative across every burst of THIS stop
     send_stop_standby_burst();
     wlogf("[machine] brew_stop: standby sent, verifying pump-off\n");
 }
@@ -491,4 +561,8 @@ bool machine_stop_ack_seen() {
 
 bool machine_stop_ack_ok() {
     return s_stop_ack_ok;
+}
+
+uint8_t machine_stop_ack_resends() {
+    return s_stop_total_ack_resends;
 }
