@@ -60,6 +60,10 @@ static volatile bool s_scan_kick = false;
 // flight). scale_radio_release() waits for this before NimBLEDevice::deinit(),
 // making the cross-task deinit race-free.
 static volatile bool s_ble_parked = false;
+// Link phase for the UI's SCALE pill (see ScaleLink in scale.h). Written ONLY
+// by scale_ble_task so there is a single writer; the UI just polls it. IDLE
+// until the task first reaches its gate (it waits for WiFi before that).
+static volatile ScaleLink s_link = SCALE_LINK_IDLE;
 
 // Bookoo write characteristic — only valid while BLE task holds an active connection.
 // Commands from other tasks are queued via s_bookoo_pending_cmd instead of calling
@@ -283,13 +287,21 @@ static void scale_ble_task(void*) {
         // connected when the toggle went OFF is dropped by the "Stay connected"
         // loop below (which also gates on settings.scale_ble_enabled), so the
         // task arrives here already disconnected and simply waits.
+        // The link state is refreshed every slice so the UI can tell "BT off"
+        // (OFF) from any other park reason (PAUSED) even if the reason changes
+        // while parked. This also covers scale_radio_suspend(): its hold parks
+        // the task here, so the link reads PAUSED once the task reaches the gate
+        // (it may first sit out a post-failure/disconnect delay reading IDLE).
         if (machine.brew_active || s_ota_hold || machine.standby ||
             !settings.scale_ble_enabled) {
             s_ble_parked = true;
             while (machine.brew_active || s_ota_hold || machine.standby ||
-                   !settings.scale_ble_enabled)
+                   !settings.scale_ble_enabled) {
+                s_link = settings.scale_ble_enabled ? SCALE_LINK_PAUSED : SCALE_LINK_OFF;
                 vTaskDelay(pdMS_TO_TICKS(500));
+            }
             s_ble_parked = false;
+            s_link = SCALE_LINK_IDLE;
         }
 
         // Fetch the scan handle AFTER the park block: a scale_radio_suspend()/
@@ -302,6 +314,7 @@ static void scale_ble_task(void*) {
         s_target_model = SCALE_NONE;
         pScan->clearResults();
 
+        s_link = SCALE_LINK_SCANNING;
         wlogf("[scale] scanning (10s)...\n");
         // NimBLE 2.x start() takes MILLISECONDS (1.x took seconds) and is
         // NON-blocking — it returns immediately. Poll s_found for the scan's
@@ -319,6 +332,9 @@ static void scale_ble_task(void*) {
         if (s_ota_hold) continue;
 
         if (!s_found) {
+            // Scan ended without a match: the UI reads SCANNING -> IDLE as a
+            // failed search (red "NO SCALE" after a tap).
+            s_link = SCALE_LINK_IDLE;
             // BLE scanning thrashes the shared WiFi radio, so pauses between scans
             // protect MQTT/OTA. But scan FAST (2 s) until the first-ever connect,
             // and for RECONNECT_FAST_WIN_MS after a disconnect, so an in-use scale
@@ -365,7 +381,9 @@ static void scale_ble_task(void*) {
         // active and the first live link died ~6 s after subscribing.
         pClient->setConnectionParams(24, 48, 4, 400);
 
+        s_link = SCALE_LINK_CONNECTING;
         if (!pClient->connect()) {
+            s_link = SCALE_LINK_IDLE;   // UI treats this as a failed search
             wlogf("[scale] connect failed, retrying...\n");
             NimBLEDevice::deleteClient(pClient);
             vTaskDelay(pdMS_TO_TICKS(5000));
@@ -381,6 +399,7 @@ static void scale_ble_task(void*) {
         }
 
         if (!ok) {
+            s_link = SCALE_LINK_IDLE;   // found but unusable: also a failed search
             pClient->disconnect();
             NimBLEDevice::deleteClient(pClient);
             vTaskDelay(pdMS_TO_TICKS(10000));
@@ -389,6 +408,7 @@ static void scale_ble_task(void*) {
 
         scale.model            = s_target_model;
         scale.connected        = true;
+        s_link                 = SCALE_LINK_CONNECTED;
         s_scale_ever_connected = true;  // gates scan cadence (see no-scale pause above)
         wlogf("[scale] %s connected\n", scale_model_name());
 
@@ -411,6 +431,7 @@ static void scale_ble_task(void*) {
         }
 
         scale.connected      = false;
+        s_link               = SCALE_LINK_IDLE;
         scale.weight_g       = 0.0f;
         scale.flow_gps       = 0.0f;
         scale.timer_ms       = 0;
@@ -470,6 +491,10 @@ uint32_t scale_weight_age_ms() {
     uint32_t t = scale.last_weight_ms;
     if (t == 0) return UINT32_MAX;   // no weight notify received yet this session
     return millis() - t;
+}
+
+ScaleLink scale_link_state() {
+    return s_link;
 }
 
 const char* scale_model_name() {

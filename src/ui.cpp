@@ -193,6 +193,17 @@ static uint32_t s_clean_press_ms = 0;
 static uint32_t s_standby_press_ms = 0;
 static lv_obj_t *obj_standby_confirm;   // yes/no overlay opened by the 2 s hold
 
+// SCALE pill feedback state (see scale_pill_cb / scale_pill_update). Only a
+// tap opens a search window: background scans stay silent, otherwise a machine
+// with no scale around would show SEARCHING forever.
+static uint32_t s_pill_search_start_ms = 0;     // millis() of the tap (0 = no search)
+static bool     s_pill_saw_scanning    = false; // task went SCANNING/CONNECTING since the tap
+static uint32_t s_pill_fail_until_ms   = 0;     // red "NO SCALE" until this millis() (0 = none)
+static uint32_t s_pill_note_until_ms   = 0;     // amber "STANDBY" note until this millis() (0 = none)
+static const uint32_t PILL_SEARCH_TIMEOUT_MS = 20000; // hard cap: two scans plus a connect
+static const uint32_t PILL_FAIL_SHOW_MS      = 4000;
+static const uint32_t PILL_NOTE_SHOW_MS      = 2000;
+
 static void target_show() {
     char buf[12];
     snprintf(buf, sizeof(buf), "%.0f g", settings.brew_target_g);
@@ -313,16 +324,35 @@ static void clean_stop_btn_cb(lv_event_t *e) {
 // disconnected, force an immediate reconnect attempt. If the BT radio toggle is
 // off, turn it on and persist (scale_set_enabled re-opens the fast-scan window);
 // if already on, kick the scale task's inter-scan pause so it re-scans within ~1 s.
+// Each accepted tap opens a SEARCHING window that scale_pill_update() resolves to
+// green (connected) or red "NO SCALE", so the user sees the tap did something.
 static void scale_pill_cb(lv_event_t *e) {
     if (scale_connected()) return;   // connected → status-only, no action
+    // The scale task parks in standby, so a kick would do nothing until wake:
+    // say why instead of showing a search that cannot happen.
+    if (machine.standby) {
+        s_pill_note_until_ms = millis() + PILL_NOTE_SHOW_MS;
+        wlogf("[scale] pill tap ignored: machine in standby\n");
+        return;
+    }
     wlogf("[scale] manual connect kick from UI\n");
-    if (!settings.scale_ble_enabled) {
+    bool just_enabled = !settings.scale_ble_enabled;
+    if (just_enabled) {
         settings.scale_ble_enabled = true;
         settings_save();
         scale_set_enabled(true);     // logs + opens the fast-scan reconnect window
     } else {
         scale_kick_fast_scan();      // already enabled → wake the paused scan loop
     }
+    // Parked for brew/OTA: the kick is pre-armed and fires when the task unparks,
+    // but no scan runs now, so don't show a SEARCHING that would only time out.
+    // (Just-enabled reads OFF here until the task's next 500 ms slice; that one
+    // does search, so it still opens the window.)
+    if (!just_enabled && scale_link_state() == SCALE_LINK_PAUSED) return;
+    s_pill_search_start_ms = millis();
+    if (s_pill_search_start_ms == 0) s_pill_search_start_ms = 1;   // 0 means "none"
+    s_pill_saw_scanning    = false;
+    s_pill_fail_until_ms   = 0;
 }
 
 static void ui_main_create() {
@@ -410,7 +440,7 @@ static void ui_main_create() {
     settemp_show();
 
     // SCALE: top-right status pill (moved here from bottom-left). Shows the scale
-    // link state (amber "SCALE" when connected, dim grey when not) and, while
+    // link state (label + colour per state, see scale_pill_update) and, while
     // disconnected, taps to force a reconnect (see scale_pill_cb). Sits in the
     // top-right corner where the old STEAM pill lived (x352-472, y8-40), clear of
     // the top-centre STANDBY pill (ends x300) and the right-edge adjuster (top y74).
@@ -420,6 +450,13 @@ static void ui_main_create() {
     lv_obj_set_style_radius(obj_scale, 16, 0);
     lv_obj_set_style_border_width(obj_scale, 0, 0);
     lv_obj_set_style_bg_color(obj_scale, lv_color_make(0x28, 0x28, 0x28), 0);
+    // Lighter background while pressed: the tap registers visually within one
+    // frame, before the scale task has changed any state.
+    lv_obj_set_style_bg_color(obj_scale, lv_color_make(0x50, 0x50, 0x50), LV_STATE_PRESSED);
+    // 16 px of extra hit area on every side: a 32 px tall pill is easy to miss
+    // with a finger. Hit box becomes x336-488, y-8..56: still clear of the
+    // STANDBY pill (ends x300) and the right-edge adjuster (top y74).
+    lv_obj_set_ext_click_area(obj_scale, 16);
     lv_obj_set_style_pad_all(obj_scale, 0, 0);
     lv_obj_clear_flag(obj_scale, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(obj_scale, scale_pill_cb, LV_EVENT_CLICKED, NULL);
@@ -671,6 +708,115 @@ static void ui_main_create() {
     lv_obj_clear_flag(lbl_clock,        LV_OBJ_FLAG_CLICKABLE);
 }
 
+// What the SCALE pill is currently showing. Tracked so the label, font and
+// colour are only rewritten on a change (every setter invalidates the pill and
+// forces a redraw); the SEARCHING blink is the one deliberate repeat.
+enum PillView {
+    PILL_NONE,        // not drawn yet: forces the first paint
+    PILL_CONNECTED,
+    PILL_BT_OFF,
+    PILL_STANDBY,
+    PILL_NO_SCALE,
+    PILL_SEARCHING,
+    PILL_IDLE
+};
+
+// True while `until_ms` (0 = unset) lies in the future. Signed difference so a
+// millis() wrap does not leave a note stuck on.
+static bool pill_until_active(uint32_t until_ms) {
+    return until_ms != 0 && (int32_t)(until_ms - millis()) > 0;
+}
+
+// Resolve an open tap-initiated search from the scale task's link phase. A
+// search fails when the task has been seen working (SCANNING/CONNECTING) and
+// has since dropped back to IDLE (scan found nothing, or connect/subscribe
+// failed), or at the hard timeout. Until the task is seen working, IDLE is just
+// "not woken yet" (the kick lands within ~1 s), so it is not a failure.
+static void scale_pill_track_search() {
+    if (s_pill_search_start_ms == 0) return;
+    ScaleLink link = scale_link_state();
+    // Parked mid-search (brew started, OTA hold): no scan is running any more,
+    // so end the window quietly rather than blinking into a timeout.
+    if (link == SCALE_LINK_PAUSED) {
+        s_pill_search_start_ms = 0;
+        return;
+    }
+    if (link == SCALE_LINK_SCANNING || link == SCALE_LINK_CONNECTING)
+        s_pill_saw_scanning = true;
+    bool failed  = s_pill_saw_scanning && link == SCALE_LINK_IDLE;
+    bool timeout = millis() - s_pill_search_start_ms > PILL_SEARCH_TIMEOUT_MS;
+    if (failed || timeout) {
+        s_pill_search_start_ms = 0;
+        s_pill_fail_until_ms   = millis() + PILL_FAIL_SHOW_MS;
+        if (s_pill_fail_until_ms == 0) s_pill_fail_until_ms = 1;   // 0 means "none"
+        wlogf("[scale] pill search ended: %s\n", timeout ? "timeout" : "not found");
+    }
+}
+
+// SCALE pill: label + colour per state (see scale_pill_cb for the tap action).
+// Background stays dark in every state, kept understated vs. the HEAT/STEAM
+// dots; only the text changes. Priority, highest first: connected, BT off,
+// standby note, failed, searching, idle.
+static void scale_pill_update() {
+    static PillView s_view  = PILL_NONE;
+    static int      s_blink = -1;   // last SEARCHING blink phase drawn (-1 = none)
+
+    static const lv_color_t C_GREEN     = lv_color_make(0x4C, 0xAF, 0x50);
+    static const lv_color_t C_AMBER     = lv_color_make(0xD4, 0x89, 0x1A);
+    static const lv_color_t C_AMBER_DIM = lv_color_make(0x6A, 0x45, 0x0D);
+    static const lv_color_t C_RED       = lv_color_make(0xE5, 0x39, 0x35);
+    static const lv_color_t C_GREY      = lv_color_make(0x70, 0x70, 0x70);
+    static const lv_color_t C_GREY_DIM  = lv_color_make(0x5A, 0x5A, 0x5A);
+
+    PillView view;
+    if (scale_connected()) {
+        // A live link supersedes any pending search, failure or note.
+        s_pill_search_start_ms = 0;
+        s_pill_fail_until_ms   = 0;
+        s_pill_note_until_ms   = 0;
+        view = PILL_CONNECTED;
+    } else {
+        scale_pill_track_search();
+        if (!settings.scale_ble_enabled)                   view = PILL_BT_OFF;
+        else if (pill_until_active(s_pill_note_until_ms))  view = PILL_STANDBY;
+        else if (pill_until_active(s_pill_fail_until_ms))  view = PILL_NO_SCALE;
+        else if (s_pill_search_start_ms != 0)              view = PILL_SEARCHING;
+        else                                               view = PILL_IDLE;
+    }
+
+    if (view != s_view) {
+        const char *text;
+        lv_color_t  col;
+        switch (view) {
+            case PILL_CONNECTED: text = "SCALE";     col = C_GREEN;     break;
+            case PILL_BT_OFF:    text = "BT OFF";    col = C_GREY_DIM;  break;
+            case PILL_STANDBY:   text = "STANDBY";   col = C_AMBER_DIM; break;
+            case PILL_NO_SCALE:  text = "NO SCALE";  col = C_RED;       break;
+            case PILL_SEARCHING: text = "SEARCHING"; col = C_AMBER;     break;
+            default:             text = "SCALE";     col = C_GREY;      break;
+        }
+        lv_label_set_text(lbl_scale, text);
+        // "SEARCHING" is ~125 px at 20 pt and overflows the 120 px pill; use 16 pt
+        // for every non-"SCALE" label so the pill's labels read as one family.
+        bool plain = (view == PILL_CONNECTED || view == PILL_IDLE);
+        lv_obj_set_style_text_font(lbl_scale,
+            plain ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(lbl_scale, col, 0);
+        s_view  = view;
+        s_blink = -1;
+    }
+
+    // ~2 Hz blink while searching: toggle amber/dim amber every 250 ms. Only
+    // repaint when the phase flips, not on every 100 ms update.
+    if (view == PILL_SEARCHING) {
+        int phase = (int)((millis() / 250) & 1);
+        if (phase != s_blink) {
+            lv_obj_set_style_text_color(lbl_scale, phase ? C_AMBER_DIM : C_AMBER, 0);
+            s_blink = phase;
+        }
+    }
+}
+
 static void ui_main_update() {
     char tbuf[20];
     if (machine.connected) {
@@ -692,12 +838,7 @@ static void ui_main_update() {
     lv_obj_set_style_bg_color(dot_heat,
         heat ? lv_color_make(0xE5, 0x39, 0x35) : lv_color_make(0x35, 0x35, 0x35), 0);
 
-    // SCALE pill: subtle amber text when a scale is linked, dim grey otherwise.
-    // Background stays dark in both states — kept understated vs. the HEAT/STEAM
-    // pills that flood-fill when active (see scale_pill_cb for the tap action).
-    bool scale_up = scale_connected();
-    lv_obj_set_style_text_color(lbl_scale,
-        scale_up ? lv_color_make(0xD4, 0x89, 0x1A) : lv_color_make(0x70, 0x70, 0x70), 0);
+    scale_pill_update();
 
     // STANDBY pill: WAKE + amber while in standby; else grey "STANDBY". Skip the
     // awake repaint while a hold is in progress so the amber press feedback shows.

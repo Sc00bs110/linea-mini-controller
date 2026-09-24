@@ -17,6 +17,25 @@ struct ScaleState {
 
 extern ScaleState scale;
 
+// Coarse BLE link phase of the scale task, for UI feedback only (the SCALE
+// pill). `scale.connected` alone cannot tell "searching" from "idle", so a tap
+// on the pill gave no visible response. Display-only: nothing in the brew or
+// brew-by-weight path reads this.
+//   OFF        parked because the user switched Scale BT off
+//   PAUSED     parked for another reason (brew, OTA hold, machine standby)
+//   IDLE       between scans / after a failed connect / after a disconnect
+//   SCANNING   a 10 s discovery scan is running
+//   CONNECTING a scale was found, connect + subscribe in progress
+//   CONNECTED  subscribed and receiving
+enum ScaleLink {
+    SCALE_LINK_OFF,
+    SCALE_LINK_PAUSED,
+    SCALE_LINK_IDLE,
+    SCALE_LINK_SCANNING,
+    SCALE_LINK_CONNECTING,
+    SCALE_LINK_CONNECTED
+};
+
 // Call once after lv_init, before WiFi — starts BLE scan task on core 0
 void  scale_init();
 
@@ -33,6 +52,9 @@ float       scale_flow();           // current flow rate in g/s (0.0 if disconne
 // yet). Used by the UI's brew-by-weight failsafe to detect a stalled scale feed.
 uint32_t    scale_weight_age_ms();
 const char* scale_model_name();     // "Felicita Arc" / "Bookoo Themis Ultra" / "—"
+// Current link phase (see ScaleLink). Written only by the scale task, safe to
+// poll from the UI/loop task: a single volatile enum, no compound updates.
+ScaleLink   scale_link_state();
 
 // Apply a change to the user's scale-BT enable toggle. The scale task polls
 // settings.scale_ble_enabled itself (parks when OFF, drops a live link); this
