@@ -112,10 +112,32 @@ static bool     bbw_armed = false;
 // arrived AFTER this shot started has been observed reading near zero. Without
 // this gate the first passes still see a STALE pre-shot sample — an untared cup
 // left on the scale (~500 g) would read >= threshold and stop the shot instantly.
-// The Bookoo auto-tares when the cup is placed, so the near-zero reading comes
-// from the scale itself, not from our queued tare command (v0.42: window widened
-// 0.5 g → 3.0 g accordingly — see the gate below).
+// With the scale in Flow mode (required, see the scale clock block) there is NO
+// automatic tare on cup placement: the near-zero reading comes from our queued
+// TARE_AND_START (0x07) at brew start, so this gate relies on that command
+// landing within the 10 s failsafe window. (v0.42 widened the window 0.5 g →
+// 3.0 g when Auto mode did the tare; it still absorbs noise and drift.)
 static bool     bbw_tared = false;
+
+// ─── Automatic Bookoo clock handling (v0.53) ──────────────────────────────────
+// Brew start: scale_reset_and_start() (RESET if the clock is non-zero, then
+// TARE_AND_START); any pending delayed reset is cancelled.
+// Lever returned to Stop (every brew, flush or real shot): STOP immediately, then
+// RESET SCALE_RESET_DELAY_MS later.
+// REQUIRED: the Bookoo must be in FLOW mode (two white LEDs) with AUTO OFF
+// (Themis Ultra manual + field tests 2026-09-26). In Flow mode the BLE commands
+// act like the left button: TARE_AND_START (0x07) starts the clock, STOP (0x05)
+// holds the shot time, RESET (0x06) clears it; there is no automatic tare on cup
+// placement, so our 0x07 at every brew start replaces the right-button tare.
+// In Auto mode this cannot work: after timing stops the scale shows a flashing
+// brew summary that only a physical button tap clears (no BLE tare/stop/start/
+// reset does), and STOP zeroes the reported clock, so the shot time is not held.
+// The lever returning is the moment the shot is over, and the scale does not
+// notice a cup being lifted (v0.51's cup-lift hold/reset never fired, removed).
+// The RESET stays delayed (v0.52 finding) and forced (scale_timer_reset_forced(),
+// no timer_ms guard) so it goes out regardless of what the reported clock reads.
+static const uint32_t SCALE_RESET_DELAY_MS = 2000;  // lever return -> delayed RESET
+static uint32_t       s_scale_reset_due_ms = 0;     // 0 = no delayed reset pending
 
 // ─── Demo mode ────────────────────────────────────────────────────────────────
 static bool     demo_brew       = false;
@@ -2069,7 +2091,12 @@ void ui_tick() {
 
     if (!was_brew && brew_now) {
         brew_start_ms  = millis();
-        scale_tare_and_start();
+        // scale_reset_and_start() sends RESET if the clock is still non-zero
+        // (e.g. the lever-return clear was missed), queued with TARE_AND_START.
+        // A pending delayed reset from the previous lever return must never
+        // fire into this new brew, so cancel it.
+        s_scale_reset_due_ms = 0;
+        scale_reset_and_start();
         bbw_stop_fired = false;
         bbw_tared      = false;
         // Brew-by-weight applies to this shot only if a scale is connected at the
@@ -2118,9 +2145,10 @@ void ui_tick() {
             // below). Require the sample itself to have arrived AFTER this shot
             // started.
             //
-            // The window is 3 g, not the old 0.5 g: the Bookoo auto-tares when the
-            // cup is placed, so by shot start it already reads ~0 and the commanded
-            // tare is belt-and-braces only. Demanding a fresh sub-0.5 g sample made
+            // The window is 3 g, not the old 0.5 g. That was widened while the scale
+            // was in Auto mode and tared itself; in Flow mode (now required) our
+            // commanded tare is the only tare, so it must land. Demanding a fresh
+            // sub-0.5 g sample made
             // the gate depend on that queued BLE tare landing, and when it didn't
             // the 10 s failsafe killed the shot — one of the two field failure
             // modes v0.42 addresses. 3 g still catches a genuinely untared cup.
@@ -2181,6 +2209,29 @@ void ui_tick() {
         if ((brew_end_ms - brew_start_ms) >= 20000 && !machine_clean_active()) {
             settings.shot_count++;
             settings.shots_since_clean++;
+        }
+        // Scale clock. Real (connected) machine only, never for a clean-cycle
+        // pump phase. Cleared for EVERY brew when the lever returns to Stop
+        // (see the block comment at the top; scale must be in Flow mode, Auto
+        // off). STOP now holds the shot time; the RESET is deferred
+        // SCALE_RESET_DELAY_MS. timer_ms is read before the command is queued.
+        if (scale_connected() && machine.connected && !machine_clean_active()) {
+            wlogf("[scale] lever returned: clock stop, reset in 2 s (timer_ms=%lu)\n",
+                  (unsigned long)scale_timer_ms());
+            scale_timer_stop();
+            uint32_t due = millis() + SCALE_RESET_DELAY_MS;
+            s_scale_reset_due_ms = (due == 0) ? 1 : due;  // 0 means "none pending"
+        }
+    }
+    // Delayed post-lever RESET. Every pass, independent of the screen (like the
+    // bbw block). Wrap-safe comparison. Dropped silently if the scale is gone,
+    // a brew has started, or a clean cycle is running.
+    if (s_scale_reset_due_ms != 0 &&
+        (int32_t)(millis() - s_scale_reset_due_ms) >= 0) {
+        s_scale_reset_due_ms = 0;
+        if (scale_connected() && !brew_now && !machine_clean_active()) {
+            wlogf("[scale] delayed reset after lever return\n");
+            scale_timer_reset_forced();
         }
     }
     // Return to main as soon as the brew ends. The machine's brew flag follows

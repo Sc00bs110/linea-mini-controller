@@ -27,6 +27,16 @@
 #define BOOKOO_WRITE_UUID     "0000FF12-0000-1000-8000-00805F9B34FB"
 
 // Command DATA1 bytes (DATA2 and DATA3 are 0x00 for all basic commands)
+//
+// REQUIRED scale mode: FLOW mode (two white LEDs) with AUTO OFF (Themis Ultra
+// manual + field tests 2026-09-26). In Flow mode these commands act like the left
+// button: 0x07 tares and starts the clock, 0x05 stops and HOLDS the time, 0x06
+// clears it. Flow mode has no automatic tare on cup placement; our 0x07 at every
+// brew start replaces the right-button tare. In Auto mode the scale's own state
+// machine shows a flashing brew summary after timing stops that only a physical
+// button tap clears (no BLE command does), and STOP zeroes the reported clock so
+// the shot time cannot be held. 0x04 (START) never started the clock on this
+// scale; 0x07 does, so 0x04 is not used.
 #define BOOKOO_CMD_TARE          0x01
 #define BOOKOO_CMD_START         0x04
 #define BOOKOO_CMD_STOP          0x05
@@ -66,10 +76,48 @@ static volatile bool s_ble_parked = false;
 static volatile ScaleLink s_link = SCALE_LINK_IDLE;
 
 // Bookoo write characteristic — only valid while BLE task holds an active connection.
-// Commands from other tasks are queued via s_bookoo_pending_cmd instead of calling
-// writeValue directly, keeping all NimBLE calls on the BLE task (core 0).
+// Commands from other tasks are queued via the command ring below instead of
+// calling writeValue directly, keeping all NimBLE calls on the BLE task.
 static NimBLERemoteCharacteristic* s_bookoo_write_char = nullptr;
-static volatile uint8_t            s_bookoo_pending_cmd = 0;  // 0 = none
+
+// ─── Bookoo command ring ──────────────────────────────────────────────────────
+//
+// v0.51 replaces the old single-slot s_bookoo_pending_cmd: a shot start now needs
+// RESET followed by TARE_AND_START, and a flush needs STOP followed by RESET, so a
+// one-slot mailbox would overwrite the first command before the BLE task sent it.
+//
+// Lock-free single-producer / single-consumer ring:
+//   producer = Arduino loop task (ui.cpp and the mqtt.cpp callbacks), and ONLY
+//              the producer writes s_cmd_tail;
+//   consumer = scale_ble_task, and ONLY the consumer writes s_cmd_head.
+// Indices are free-running uint8_t counters (slot = index & MASK); 256 is a
+// multiple of the ring size, so (uint8_t)(tail - head) is the fill level across
+// wrap-around. The Scale task is created unpinned, so on the S3 it may run on the
+// other core from loop(): volatile alone does not order stores between cores,
+// hence the explicit __sync_synchronize() fences at each publish/consume point.
+//
+// Staleness: every entry carries the connection epoch it was queued under and
+// its enqueue time. The consumer discards an entry from an earlier connection or
+// older than CMD_MAX_AGE_MS instead of sending it — a clock command that arrives
+// seconds late (or on a fresh link) would act on the wrong shot. The ring is never
+// cleared from the consumer side (that would race the producer's tail).
+struct BookooCmd {
+    uint8_t  cmd;       // BOOKOO_CMD_* DATA1 byte
+    uint8_t  epoch;     // s_epoch at enqueue time
+    uint32_t enq_ms;    // millis() at enqueue time
+};
+static const uint8_t  CMD_RING_SIZE  = 8;               // must divide 256
+static const uint8_t  CMD_RING_MASK  = CMD_RING_SIZE - 1;
+static const uint32_t CMD_MAX_AGE_MS = 1500;            // older entries are discarded
+static const uint32_t CMD_GAP_MS     = 100;             // min spacing between writes
+static BookooCmd        s_cmd_ring[CMD_RING_SIZE];
+static volatile uint8_t s_cmd_head = 0;   // next entry to send   (consumer-owned)
+static volatile uint8_t s_cmd_tail = 0;   // next free slot       (producer-owned)
+// Connection epoch. Incremented ONLY by scale_ble_task: before scale.connected
+// goes true on connect, and where it goes false on disconnect. A producer that
+// sees scale.connected and then stamps the epoch can therefore only ever stamp
+// the current link's epoch or a stale one — never a future link's.
+static volatile uint8_t s_epoch = 0;
 
 // ─── Bookoo helpers ───────────────────────────────────────────────────────────
 
@@ -84,6 +132,133 @@ static void bookoo_send_cmd(uint8_t data1, uint8_t data2, uint8_t data3) {
     uint8_t pkt[6] = { 0x03, 0x0A, data1, data2, data3, 0 };
     pkt[5] = bookoo_checksum(pkt, 5);
     s_bookoo_write_char->writeValue(pkt, 6, false);
+}
+
+static const char* bookoo_cmd_name(uint8_t cmd) {
+    switch (cmd) {
+        case BOOKOO_CMD_TARE:           return "TARE";
+        case BOOKOO_CMD_START:          return "START";
+        case BOOKOO_CMD_STOP:           return "STOP";
+        case BOOKOO_CMD_RESET:          return "RESET";
+        case BOOKOO_CMD_TARE_AND_START: return "TARE_AND_START";
+        default:                        return "?";
+    }
+}
+
+// Producer side (Arduino loop task only). Queues n commands as ONE unit: all
+// entries are written first and the tail is advanced once, so the consumer sees
+// either none or all of them. If fewer than n slots are free the whole push is
+// dropped — a lone TARE_AND_START without its preceding RESET, or a lone RESET
+// without its STOP, would leave the clock in a state the caller did not ask for.
+static bool bookoo_push(const uint8_t* cmds, uint8_t n) {
+    // Gate on a live Bookoo link: entries are stamped with the current epoch, and
+    // queuing while disconnected would only be discarded later anyway.
+    if (!scale.connected || scale.model != SCALE_BOOKOO_THEMIS) return false;
+
+    uint8_t tail = s_cmd_tail;                        // our own index
+    uint8_t used = (uint8_t)(tail - s_cmd_head);      // cast: wrap-safe fill level
+    if ((uint8_t)(CMD_RING_SIZE - used) < n) {
+        wlogf("[scale] cmd ring full (%u queued), dropped %u cmd(s) starting %s\n",
+              (unsigned)used, (unsigned)n, bookoo_cmd_name(cmds[0]));
+        return false;
+    }
+
+    uint8_t  ep  = s_epoch;
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < n; i++) {
+        BookooCmd& e = s_cmd_ring[(uint8_t)(tail + i) & CMD_RING_MASK];
+        e.cmd    = cmds[i];
+        e.epoch  = ep;
+        e.enq_ms = now;
+    }
+    __sync_synchronize();          // entries visible before the tail that publishes them
+    s_cmd_tail = (uint8_t)(tail + n);
+    return true;
+}
+
+static bool bookoo_push1(uint8_t cmd) {
+    return bookoo_push(&cmd, 1);
+}
+
+// Deferred "what did the clock do?" reports, BLE task only. Kept as low-volume
+// field diagnostics: each send is followed by a timer_ms readback 600 ms later
+// (and 1200 ms for the start commands, so a clock that is not advancing — e.g. a
+// scale left in the wrong mode — is visible). Several slots because RESET and
+// TARE_AND_START go out ~100 ms apart and each needs its line.
+struct CmdReport {
+    uint8_t  cmd;        // 0 = slot free
+    uint8_t  stage;      // 0 = +600 pending, 1 = +1200 pending
+    uint32_t sent_ms;
+};
+static const uint8_t CMD_REPORT_SLOTS = 4;
+static CmdReport     s_cmd_reports[CMD_REPORT_SLOTS];
+
+static void cmd_report_add(uint8_t cmd, uint32_t sent_ms) {
+    // Take a free slot; if all are busy, overwrite the oldest (diagnostic only).
+    uint8_t pick = 0;
+    for (uint8_t i = 0; i < CMD_REPORT_SLOTS; i++) {
+        if (s_cmd_reports[i].cmd == 0) { pick = i; break; }
+        if (s_cmd_reports[i].sent_ms - s_cmd_reports[pick].sent_ms > 0x80000000UL)
+            pick = i;    // i was sent earlier than pick (wrap-safe comparison)
+    }
+    s_cmd_reports[pick].cmd     = cmd;
+    s_cmd_reports[pick].stage   = 0;
+    s_cmd_reports[pick].sent_ms = sent_ms;
+}
+
+static void cmd_reports_tick() {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < CMD_REPORT_SLOTS; i++) {
+        CmdReport& r = s_cmd_reports[i];
+        if (r.cmd == 0) continue;
+        uint32_t due = (r.stage == 0) ? 600 : 1200;
+        if (now - r.sent_ms < due) continue;
+        wlogf("[scale] timer_ms now %lu (%s+%lums)\n", (unsigned long)scale.timer_ms,
+              bookoo_cmd_name(r.cmd), (unsigned long)due);
+        bool is_start = (r.cmd == BOOKOO_CMD_START || r.cmd == BOOKOO_CMD_TARE_AND_START);
+        if (r.stage == 0 && is_start) r.stage = 1;
+        else                          r.cmd   = 0;
+    }
+}
+
+static void cmd_reports_clear() {
+    for (uint8_t i = 0; i < CMD_REPORT_SLOTS; i++) s_cmd_reports[i].cmd = 0;
+}
+
+// Consumer side (scale_ble_task only). Discards any stale entries at the head,
+// then sends at most ONE live command, and only if CMD_GAP_MS has passed since the
+// previous write (back-to-back unacknowledged writes risk the scale dropping one).
+// Returns true while entries remain queued so the caller can poll faster.
+static bool bookoo_drain(uint32_t& last_write_ms) {
+    for (;;) {
+        uint8_t head = s_cmd_head;                    // our own index
+        if (head == s_cmd_tail) return false;         // empty
+        __sync_synchronize();                         // tail seen before reading its entries
+        BookooCmd e = s_cmd_ring[head & CMD_RING_MASK];
+        uint32_t now = millis();
+
+        bool stale = (e.epoch != s_epoch) || (now - e.enq_ms > CMD_MAX_AGE_MS) ||
+                     s_target_model != SCALE_BOOKOO_THEMIS;
+        if (!stale && now - last_write_ms < CMD_GAP_MS)
+            return true;                              // live, but too soon — next pass
+
+        __sync_synchronize();                         // finish reading before freeing the slot
+        s_cmd_head = (uint8_t)(head + 1);
+
+        if (stale) {
+            wlogf("[scale] cmd %s discarded (stale: age=%lums epoch=%u/%u)\n",
+                  bookoo_cmd_name(e.cmd), (unsigned long)(now - e.enq_ms),
+                  (unsigned)e.epoch, (unsigned)s_epoch);
+            continue;                                 // look at the next entry
+        }
+
+        bookoo_send_cmd(e.cmd, 0, 0);
+        last_write_ms = millis();
+        wlogf("[scale] cmd %s sent (timer_ms=%lu)\n", bookoo_cmd_name(e.cmd),
+              (unsigned long)scale.timer_ms);
+        cmd_report_add(e.cmd, last_write_ms);
+        return s_cmd_head != s_cmd_tail;
+    }
 }
 
 // ─── Bookoo notify callback (called from NimBLE task, core 0) ─────────────────
@@ -407,6 +582,10 @@ static void scale_ble_task(void*) {
         }
 
         scale.model            = s_target_model;
+        // New epoch BEFORE connected goes true: any command the loop task queues
+        // once it sees this link is stamped with this epoch, and anything left
+        // in the ring from an earlier link is recognisably stale.
+        s_epoch                = (uint8_t)(s_epoch + 1);
         scale.connected        = true;
         s_link                 = SCALE_LINK_CONNECTED;
         s_scale_ever_connected = true;  // gates scan cadence (see no-scale pause above)
@@ -418,18 +597,23 @@ static void scale_ble_task(void*) {
         // Break on !settings.scale_ble_enabled too: turning the toggle OFF while
         // connected drops the link here (cleanup below issues a clean disconnect
         // via deleteClient), then the task parks at the gate above.
+        // Drain the command ring: one command per pass, >= CMD_GAP_MS apart. Poll
+        // every 50 ms while commands are queued (a RESET+TARE_AND_START pair lands
+        // ~100 ms apart instead of 400 ms), 200 ms otherwise as before.
+        uint32_t last_write_ms = millis() - CMD_GAP_MS;
         while (pClient->isConnected() && !s_ota_hold && settings.scale_ble_enabled) {
-            // Drain pending command queue (Bookoo only)
-            if (s_target_model == SCALE_BOOKOO_THEMIS) {
-                uint8_t cmd = s_bookoo_pending_cmd;
-                if (cmd != 0) {
-                    s_bookoo_pending_cmd = 0;
-                    bookoo_send_cmd(cmd, 0, 0);
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
+            bool pending = bookoo_drain(last_write_ms);
+            cmd_reports_tick();
+            vTaskDelay(pdMS_TO_TICKS(pending ? 50 : 200));
         }
 
+        // Pending readbacks belong to the dead link; a "timer_ms now 0" line
+        // after the drop would read like a command effect.
+        cmd_reports_clear();
+        // Epoch moves with connected=false: entries queued on this link are
+        // discarded, never sent on the next one. The ring itself is NOT cleared
+        // here — only the producer may touch the tail.
+        s_epoch              = (uint8_t)(s_epoch + 1);
         scale.connected      = false;
         s_link               = SCALE_LINK_IDLE;
         scale.weight_g       = 0.0f;
@@ -440,7 +624,6 @@ static void scale_ble_task(void*) {
         scale.last_weight_ms = 0;            // no live feed → bbw failsafe sees "never"
         s_last_disconnect_ms = millis();     // fast-rescan window for a quick reconnect
         s_bookoo_write_char   = nullptr;
-        s_bookoo_pending_cmd  = 0;
         wlogf("[scale] disconnected — rescanning in 3s\n");
         NimBLEDevice::deleteClient(pClient);
         // Short pause: an awake scale sleeps within minutes, so a 30 s wait
@@ -462,17 +645,51 @@ void scale_init() {
 void scale_tare() {
     if (!scale.connected) return;
     if (scale.model == SCALE_BOOKOO_THEMIS) {
-        s_bookoo_pending_cmd = BOOKOO_CMD_TARE;
+        bookoo_push1(BOOKOO_CMD_TARE);
     } else {
         Serial.println("[scale] tare: Felicita command sequence not yet documented");
     }
 }
 
 void scale_tare_and_start() {
-    if (!scale.connected) return;
-    if (scale.model == SCALE_BOOKOO_THEMIS) {
-        s_bookoo_pending_cmd = BOOKOO_CMD_TARE_AND_START;
+    bookoo_push1(BOOKOO_CMD_TARE_AND_START);
+}
+
+void scale_timer_stop() {
+    bookoo_push1(BOOKOO_CMD_STOP);
+}
+
+void scale_timer_reset() {
+    // Nothing to clear: skip the write (and its unverified side effects) when
+    // the clock already reads 0:00.
+    if (scale.timer_ms == 0) return;
+    bookoo_push1(BOOKOO_CMD_RESET);
+}
+
+void scale_timer_reset_forced() {
+    // No timer_ms guard (v0.53): used for the delayed reset ~2 s after the lever
+    // returns. The reset must go out whatever the reported clock reads (in Auto
+    // mode STOP had already zeroed it while the display still flashed), so the
+    // guarded scale_timer_reset() could be a silent no-op exactly when needed.
+    // bookoo_push() still requires a connected Bookoo; the drain logs the send.
+    bookoo_push1(BOOKOO_CMD_RESET);
+}
+
+void scale_reset_and_start() {
+    // RESET is queued only when the scale still shows a non-zero clock, then
+    // TARE_AND_START. A delayed reset still pending from the previous lever
+    // return is cancelled at brew start by the UI before this is called.
+    // One push, so the pair is queued all-or-nothing.
+    if (scale.timer_ms != 0) {
+        const uint8_t cmds[2] = { BOOKOO_CMD_RESET, BOOKOO_CMD_TARE_AND_START };
+        bookoo_push(cmds, 2);
+    } else {
+        bookoo_push1(BOOKOO_CMD_TARE_AND_START);
     }
+}
+
+uint32_t scale_timer_ms() {
+    return scale.timer_ms;
 }
 
 bool scale_connected() {

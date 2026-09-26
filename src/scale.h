@@ -42,8 +42,22 @@ void  scale_init();
 // Send tare command to active scale
 void  scale_tare();
 
-// Bookoo only: tare weight and start timer atomically (use at shot start)
+// Bookoo only: tare weight and start timer atomically
 void  scale_tare_and_start();
+
+// Bookoo scale-clock control (v0.51). All commands are queued to the BLE task
+// (see the command ring in scale.cpp); every call is a no-op unless a Bookoo is
+// connected. Called from the Arduino loop task only (single producer).
+// Requires the scale in Flow mode with Auto off — see the note in scale.cpp.
+void  scale_timer_stop();          // freeze the scale clock
+void  scale_timer_reset();         // clock back to 0:00; no-op when timer_ms == 0
+// RESET without the timer_ms guard (v0.53): the delayed post-lever reset must go
+// out even though STOP has already zeroed the reported clock.
+void  scale_timer_reset_forced();
+// Shot start: RESET (only if the clock is not already 0) then TARE_AND_START,
+// queued as one all-or-nothing unit so a full queue never splits the pair.
+void  scale_reset_and_start();
+uint32_t scale_timer_ms();         // last timer value notified by the scale (0 if none)
 
 bool        scale_connected();
 float       scale_weight();         // current weight in grams (0.0 if disconnected)
